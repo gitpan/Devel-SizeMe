@@ -15,6 +15,9 @@
 #include "EXTERN.h"
 #include "perl.h"
 #include "XSUB.h"
+
+#define DPPP_PL_parser_NO_DUMMY
+#define NEED_PL_parser
 #include "ppport.h"
 
 #include "refcounted_he.h"
@@ -39,6 +42,15 @@
 #ifndef SvSHARED_HEK_FROM_PV
 #  define SvSHARED_HEK_FROM_PV(pvx) \
         ((struct hek*)(pvx - STRUCT_OFFSET(struct hek, hek_key)))
+#endif
+#ifndef CopHINTHASH_get
+#define CopHINTHASH_get(c)  ((COPHH*)((c)->cop_hints_hash))
+#endif
+#ifndef MUTABLE_AV
+#define MUTABLE_AV(p) ((AV*)p)
+#endif
+#ifndef MUTABLE_SV
+#define MUTABLE_SV(p) ((SV*)p)
 #endif
 
 #if PERL_VERSION < 6
@@ -778,6 +790,7 @@ hek_size(pTHX_ struct state *st, HEK *hek, U32 shared, pPATH)
     return 1;
 }
 
+#if (PERL_BCDVERSION >= 0x5009004)
 static void
 refcounted_he_size(pTHX_ struct state *st, struct refcounted_he *he, pPATH)
 {
@@ -796,6 +809,7 @@ refcounted_he_size(pTHX_ struct state *st, struct refcounted_he *he, pPATH)
   if (he->refcounted_he_next)
     refcounted_he_size(aTHX_ st, he->refcounted_he_next, NPathLink("refcounted_he_next"));
 }
+#endif
 
 static void op_size_class(pTHX_ const OP * const baseop, opclass op_class, bool skip_op_struct, struct state *st, pPATH);
 
@@ -916,7 +930,6 @@ op_size_class(pTHX_ const OP * const baseop, opclass op_class, bool skip_op_stru
 	case OPc_COP: TAG;
         {
           COP *basecop;
-	  COPHH *hh;
           basecop = (COP *)baseop;
 	  if (!skip_op_struct)
 	    ADD_SIZE(st, "cop", sizeof(struct cop));
@@ -933,15 +946,15 @@ op_size_class(pTHX_ const OP * const baseop, opclass op_class, bool skip_op_stru
 #endif
 #ifdef USE_ITHREADS
           check_new_and_strlen(st, basecop->cop_file, NPathLink("cop_file"));
-          check_new_and_strlen(st, basecop->cop_stashpv, NPathLink("cop_stashpv"));
+          /*check_new_and_strlen(st, basecop->cop_stashpv, NPathLink("cop_stashpv"));  XXX */
 #else
           if (SvREFCNT(basecop->cop_stash) == 1) /* XXX hack? */
             sv_size(aTHX_ st, NPathLink("cop_stash"), (SV *)basecop->cop_stash, SOME_RECURSION);
 	  sv_size(aTHX_ st, NPathLink("cop_filegv"), (SV *)basecop->cop_filegv, SOME_RECURSION);
 #endif
-
-	  hh = CopHINTHASH_get(basecop);
-	  refcounted_he_size(aTHX_ st, hh, NPathLink("cop_hints_hash"));
+#if (PERL_BCDVERSION >= 0x5009004)
+	  refcounted_he_size(aTHX_ st, CopHINTHASH_get(basecop), NPathLink("cop_hints_hash"));
+#endif
         }
         TAG;break;
       default:
@@ -1163,9 +1176,11 @@ sv_size(pTHX_ struct state *const st, pPATH, const SV * const orig_thing,
 
   case SVt_PVHV: TAG;
     /* Now the array of buckets */
-    if (HvENAME(thing)) {
-        ADD_ATTR(st, NPattr_NAME, HvENAME(thing), 0);
-    }
+#ifdef HvENAME
+    if (HvENAME(thing)) { ADD_ATTR(st, NPattr_NAME, HvENAME(thing), 0); }
+#else
+    if (HvNAME(thing))  { ADD_ATTR(st, NPattr_NAME, HvNAME(thing), 0); }
+#endif
     ADD_SIZE(st, "hv_max", (sizeof(HE *) * (HvMAX(thing) + 1)));
     /* Now walk the bucket chain */
     if (HvARRAY(thing)) {
@@ -1304,7 +1319,11 @@ else warn("skipped suspect HeVAL %p", HeVAL(cur_entry));
 #ifdef GvFILE_HEK
 	hek_size(aTHX_ st, GvFILE_HEK(thing), 1, NPathLink("GvFILE_HEK"));
 #elif defined(GvFILE)
-#  if !defined(USE_ITHREADS) || (PERL_VERSION > 8 || (PERL_VERSION == 8 && PERL_SUBVERSION > 8))
+/* XXX this coredumped for me in t/recurse.t with a non-threaded 5.8.9
+ * so I've changed the condition to be more restricive
+ *#  if !defined(USE_ITHREADS) || (PERL_VERSION > 8 || (PERL_VERSION == 8 && PERL_SUBVERSION > 8))
+ */
+#  if (PERL_VERSION > 8 || (PERL_VERSION == 8 && PERL_SUBVERSION > 9))
 	/* With itreads, before 5.8.9, this can end up pointing to freed memory
 	   if the GV was created in an eval, as GvFILE() points to CopFILE(),
 	   and the relevant COP has been freed on scope cleanup after the eval.
@@ -1356,7 +1375,8 @@ else warn("skipped suspect HeVAL %p", HeVAL(cur_entry));
   if (type >= SVt_PVMG) {
     if (SvMAGICAL(thing))
       magic_size(aTHX_ thing, st, NPathLink("MG"));
-    if (SvPAD_OUR(thing) && SvOURSTASH(thing))
+    /* SVpad_OUR shares same flag bit as SVpbm_VALID and others */
+    if (type == SVt_PVGV && SvPAD_OUR(thing) && SvOURSTASH(thing))
       sv_size(aTHX_ st, NPathLink("SvOURSTASH"), (SV *)SvOURSTASH(thing), SOME_RECURSION);
     if (SvSTASH(thing))
       sv_size(aTHX_ st, NPathLink("SvSTASH"), (SV *)SvSTASH(thing), SOME_RECURSION);
@@ -1392,10 +1412,10 @@ new_state(pTHX)
     Newxz(st, 1, struct state);
     st->go_yell = TRUE;
     st->min_recurse_threshold = TOTAL_SIZE_RECURSION;
-    if (NULL != (warn_flag = perl_get_sv("Devel::Size::warn", FALSE))) {
+    if (NULL != (warn_flag = get_sv("Devel::Size::warn", FALSE))) {
 	st->dangle_whine = st->go_yell = SvIV(warn_flag) ? TRUE : FALSE;
     }
-    if (NULL != (warn_flag = perl_get_sv("Devel::Size::dangle", FALSE))) {
+    if (NULL != (warn_flag = get_sv("Devel::Size::dangle", FALSE))) {
 	st->dangle_whine = SvIV(warn_flag) ? TRUE : FALSE;
     }
     st->start_time_nv = gettimeofday_nv();
@@ -1479,6 +1499,7 @@ madprop_size(pTHX_ struct state *const st, pPath, MADPROP *prop)
 }
 #endif
 
+#if (PERL_BCDVERSION >= 0x5009005)
 static void
 parser_size(pTHX_ struct state *const st, pPATH, yy_parser *parser)
 {
@@ -1490,12 +1511,17 @@ parser_size(pTHX_ struct state *const st, pPATH, yy_parser *parser)
 
   NPathPushNode("stack", NPtype_NAME);
   yy_stack_frame *ps;
-  //warn("total: %u", parser->stack_size);
-  //warn("foo: %u", parser->ps - parser->stack);
+  /*warn("total: %u", parser->stack_size); */
+  /*warn("foo: %u", parser->ps - parser->stack); */
   ADD_SIZE(st, "stack_frames", parser->stack_size * sizeof(yy_stack_frame));
   for (ps = parser->stack; ps <= parser->ps; ps++) {
+#if (PERL_BCDVERSION >= 0x5011001) /* roughly */
     if (sv_size(aTHX_ st, NPathLink("compcv"), (SV*)ps->compcv, TOTAL_SIZE_RECURSION))
         ADD_LINK_ATTR(st, NPattr_NOTE, "i", ps - parser->ps);
+#else /* prior to perl 8c63ea58  Dec 8 2009 */
+    if (sv_size(aTHX_ st, NPathLink("comppad"), (SV*)ps->comppad, TOTAL_SIZE_RECURSION))
+        ADD_LINK_ATTR(st, NPattr_NOTE, "i", ps - parser->ps);
+#endif
   }
   NPathPopNode;
 
@@ -1503,7 +1529,7 @@ parser_size(pTHX_ struct state *const st, pPATH, yy_parser *parser)
   sv_size(aTHX_ st, NPathLink("lex_stuff"), (SV*)parser->lex_stuff, TOTAL_SIZE_RECURSION);
   sv_size(aTHX_ st, NPathLink("linestr"), (SV*)parser->linestr, TOTAL_SIZE_RECURSION);
   sv_size(aTHX_ st, NPathLink("in_my_stash"), (SV*)parser->in_my_stash, TOTAL_SIZE_RECURSION);
-  //sv_size(aTHX_ st, NPathLink("rsfp"), parser->rsfp, TOTAL_SIZE_RECURSION);
+  /*sv_size(aTHX_ st, NPathLink("rsfp"), parser->rsfp, TOTAL_SIZE_RECURSION); */
   sv_size(aTHX_ st, NPathLink("rsfp_filters"), (SV*)parser->rsfp_filters, TOTAL_SIZE_RECURSION);
 #ifdef PERL_MAD
   sv_size(aTHX_ st, NPathLink("endwhite"), parser->endwhite, TOTAL_SIZE_RECURSION);
@@ -1522,6 +1548,7 @@ parser_size(pTHX_ struct state *const st, pPATH, yy_parser *parser)
   if (parser->old_parser)
     parser_size(aTHX_ st, NPathLink("old_parser"), parser->old_parser);
 }
+#endif
 
 static void
 perl_size(pTHX_ struct state *const st, pPATH)
@@ -1551,8 +1578,12 @@ perl_size(pTHX_ struct state *const st, pPATH)
   sv_size(aTHX_ st, NPathLink("PL_errors"), (SV*)PL_errors, TOTAL_SIZE_RECURSION);
   sv_size(aTHX_ st, NPathLink("PL_stashcache"), (SV*)PL_stashcache, TOTAL_SIZE_RECURSION);
   sv_size(aTHX_ st, NPathLink("PL_patchlevel"), (SV*)PL_patchlevel, TOTAL_SIZE_RECURSION);
+#ifdef PL_apiversion
   sv_size(aTHX_ st, NPathLink("PL_apiversion"), (SV*)PL_apiversion, TOTAL_SIZE_RECURSION);
+#endif
+#ifdef PL_registered_mros
   sv_size(aTHX_ st, NPathLink("PL_registered_mros"), (SV*)PL_registered_mros, TOTAL_SIZE_RECURSION);
+#endif
 #ifdef USE_ITHREADS
   sv_size(aTHX_ st, NPathLink("PL_regex_padav"), (SV*)PL_regex_padav, TOTAL_SIZE_RECURSION);
 #endif
@@ -1566,24 +1597,34 @@ perl_size(pTHX_ struct state *const st, pPATH)
   sv_size(aTHX_ st, NPathLink("PL_hintgv"), (SV*)PL_hintgv, TOTAL_SIZE_RECURSION);
   sv_size(aTHX_ st, NPathLink("PL_e_script"), (SV*)PL_e_script, TOTAL_SIZE_RECURSION);
   sv_size(aTHX_ st, NPathLink("PL_encoding"), (SV*)PL_encoding, TOTAL_SIZE_RECURSION);
+#ifdef PL_ofsgv
   sv_size(aTHX_ st, NPathLink("PL_ofsgv"), (SV*)PL_ofsgv, TOTAL_SIZE_RECURSION);
+#endif
   sv_size(aTHX_ st, NPathLink("PL_argvout_stack"), (SV*)PL_argvout_stack, TOTAL_SIZE_RECURSION);
   sv_size(aTHX_ st, NPathLink("PL_beginav"), (SV*)PL_beginav, TOTAL_SIZE_RECURSION);
   sv_size(aTHX_ st, NPathLink("PL_beginav_save"), (SV*)PL_beginav_save, TOTAL_SIZE_RECURSION);
   sv_size(aTHX_ st, NPathLink("PL_checkav_save"), (SV*)PL_checkav_save, TOTAL_SIZE_RECURSION);
+#ifdef PL_unitcheckav
   sv_size(aTHX_ st, NPathLink("PL_unitcheckav"), (SV*)PL_unitcheckav, TOTAL_SIZE_RECURSION);
+#endif
+#ifdef PL_unitcheckav_save
   sv_size(aTHX_ st, NPathLink("PL_unitcheckav_save"), (SV*)PL_unitcheckav_save, TOTAL_SIZE_RECURSION);
+#endif
   sv_size(aTHX_ st, NPathLink("PL_endav"), (SV*)PL_endav, TOTAL_SIZE_RECURSION);
   sv_size(aTHX_ st, NPathLink("PL_checkav"), (SV*)PL_checkav, TOTAL_SIZE_RECURSION);
   sv_size(aTHX_ st, NPathLink("PL_initav"), (SV*)PL_initav, TOTAL_SIZE_RECURSION);
+#ifdef PL_isarev
   sv_size(aTHX_ st, NPathLink("PL_isarev"), (SV*)PL_isarev, TOTAL_SIZE_RECURSION);
+#endif
   sv_size(aTHX_ st, NPathLink("PL_fdpid"), (SV*)PL_fdpid, TOTAL_SIZE_RECURSION);
   sv_size(aTHX_ st, NPathLink("PL_preambleav"), (SV*)PL_preambleav, TOTAL_SIZE_RECURSION);
   sv_size(aTHX_ st, NPathLink("PL_ors_sv"), (SV*)PL_ors_sv, TOTAL_SIZE_RECURSION);
   sv_size(aTHX_ st, NPathLink("PL_modglobal"), (SV*)PL_modglobal, TOTAL_SIZE_RECURSION);
   sv_size(aTHX_ st, NPathLink("PL_custom_op_names"), (SV*)PL_custom_op_names, TOTAL_SIZE_RECURSION);
   sv_size(aTHX_ st, NPathLink("PL_custom_op_descs"), (SV*)PL_custom_op_descs, TOTAL_SIZE_RECURSION);
+#ifdef PL_custom_ops
   sv_size(aTHX_ st, NPathLink("PL_custom_ops"), (SV*)PL_custom_ops, TOTAL_SIZE_RECURSION);
+#endif
   sv_size(aTHX_ st, NPathLink("PL_compcv"), (SV*)PL_compcv, TOTAL_SIZE_RECURSION);
   sv_size(aTHX_ st, NPathLink("PL_DBcv"), (SV*)PL_DBcv, TOTAL_SIZE_RECURSION);
 #ifdef PERL_USES_PL_PIDSTATUS
@@ -1617,7 +1658,10 @@ perl_size(pTHX_ struct state *const st, pPATH)
   op_size_class(aTHX_ (OP*)&PL_compiling, OPc_COP, 1, st, NPathLink("PL_compiling"));
   op_size_class(aTHX_ (OP*)PL_curcopdb, OPc_COP, 0, st, NPathLink("PL_curcopdb"));
 
+#if (PERL_BCDVERSION >= 0x5009005)
   parser_size(aTHX_ st, NPathLink("PL_parser"), PL_parser);
+#endif
+
   /* TODO stacks: cur, main, tmps, mark, scope, save */
   /* TODO PL_exitlist */
   /* TODO PL_reentrant_buffers etc */

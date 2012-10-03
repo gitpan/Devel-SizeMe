@@ -27,7 +27,7 @@ require 5.005;
 require Exporter;
 require XSLoader;
 
-$VERSION = '0.020_080';
+$VERSION = '0.020_081';
 @ISA = qw(Exporter);
 
 @EXPORT_OK = qw(size total_size perl_size heap_size);
@@ -119,6 +119,36 @@ Please report bugs to:
 If loaded using the perl C<-d> option (i.e., C<perl -d:SizeMe ...>)
 then perl memory usage data will be written to a C<sizeme.db> file in the
 current directory when the script ends.
+
+=head1 FUNCTIONS
+
+=head2 size
+
+    $size_in_bytes = size( $ref_to_data );
+
+Measures and returns the size of the referenced data, without including any
+other data referenced by it.
+
+=head2 total_size
+
+    $size_in_bytes = total_size( $ref_to_data );
+
+Like </size> but does include referenced data.
+
+=head2 perl_size
+
+    $size_in_bytes = perl_size();
+
+Measures and returns the size of the entire perl interpreter. This is similar
+to calling C<total_size( \%main:: )> but also includes all the perl internals.
+
+=head2 heap_size
+
+    $size_in_bytes = heap_size();
+
+Measures and returns the size of the entire process heap space.
+
+Not accurate yet.
 
 =head1 COPYRIGHT
 
