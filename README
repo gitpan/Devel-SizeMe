@@ -13,6 +13,7 @@ Current implementation is all very alpha and rather hackish.
 
 TODO:
 
+    Remove log scale checkboc from the treemp as it doesn't work yet
     Devel::SizeMe::Core - loads XS and sets options
     Devel::SizeMe - loads Devel::SizeMe::Core
         -d:SizeMe=opts?
