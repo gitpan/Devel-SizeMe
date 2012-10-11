@@ -243,7 +243,7 @@ static const char *svtypenames[SVt_LAST] = {
 };
 
 static NV
-gettimeofday_nv(void)
+gettimeofday_nv(pTHX)
 {
 #ifdef HAS_GETTIMEOFDAY
     struct timeval when;
@@ -270,7 +270,7 @@ np_print_node_name(pTHX_ FILE *fp, npath_node_t *npath_node)
         const char *typename = (type == SVt_IV && SvROK(sv)) ? "RV" : svtypenames[type];
         fprintf(fp, "SV(%s)", typename);
         switch(type) {  /* add some useful details */
-        case SVt_PVAV: fprintf(fp, " fill=%d/%ld", av_len((AV*)sv), AvMAX((AV*)sv)); break;
+        case SVt_PVAV: fprintf(fp, " fill=%ld/%ld", (long)av_len((AV*)sv), AvMAX((AV*)sv)); break;
         case SVt_PVHV: fprintf(fp, " fill=%ld/%ld", HvFILL((HV*)sv), HvMAX((HV*)sv)); break;
         }
         break;
@@ -300,7 +300,7 @@ np_print_node_name(pTHX_ FILE *fp, npath_node_t *npath_node)
 }
 
 void
-np_dump_indent(int depth) {
+np_dump_indent(pTHX_ int depth) {
     while (depth-- > 0)
         fprintf(stderr, ":   ");
 }
@@ -342,7 +342,7 @@ np_dump_formatted_node(pTHX_ struct state *st, npath_node_t *npath_node, npath_n
     PERL_UNUSED_ARG(npath_node_deeper);
     if (0 && npath_node->type == NPtype_LINK)
         return 1;
-    np_dump_indent(npath_node->depth);
+    np_dump_indent(aTHX_ npath_node->depth);
     np_print_node_name(aTHX_ stderr, npath_node);
     if (npath_node->type == NPtype_LINK)
         fprintf(stderr, "->"); /* cosmetic */
@@ -357,7 +357,7 @@ np_dump_node_path_info(pTHX_ struct state *st, npath_node_t *npath_node, UV attr
     if (attr_type == NPattr_LEAFSIZE && !attr_value)
         return; /* ignore zero sized leaf items */
     np_walk_new_nodes(aTHX_ st, npath_node, NULL, np_dump_formatted_node);
-    np_dump_indent(npath_node->depth+1);
+    np_dump_indent(aTHX_ npath_node->depth+1);
     switch (attr_type) {
     case NPattr_LEAFSIZE:
         fprintf(stderr, "+%ld %s =%ld", attr_value, attr_name, attr_value+st->total_size);
@@ -756,7 +756,7 @@ regex_size(pTHX_ const REGEXP * const baseregex, struct state *st, pPATH) {
   /*ADD_SIZE(st, strlen(SvANY(baseregex)->subbeg));*/
 #endif
   if (st->go_yell && !st->regex_whine) {
-    carp("Devel::Size: Calculated sizes for compiled regexes are incompatible, and probably always will be");
+    carp("Devel::Size: Calculated sizes for compiled regexes are incomplete");
     st->regex_whine = 1;
   }
 }
@@ -977,7 +977,7 @@ if(0)do_op_dump(0, Perl_debug_log, baseop);
   }
 }
 
-#if PERL_VERSION < 8 || PERL_SUBVERSION < 9 /* XXX plain || seems like a bug */
+#if (PERL_BCDVERSION <= 0x5008008)
 #  define SVt_LAST 16
 #endif
 
@@ -1130,7 +1130,7 @@ sv_size(pTHX_ struct state *const st, pPATH, const SV * const orig_thing,
 
   type = SvTYPE(thing);
   if (type > SVt_LAST) {
-      warn("Devel::Size: Unknown variable type: %d encountered\n", type);
+      warn("Devel::Size: Unknown variable type: %u encountered\n", type);
       return 0;
   }
   NPathPushNode(thing, NPtype_SV);
@@ -1398,10 +1398,9 @@ else warn("skipped suspect HeVAL %p", HeVAL(cur_entry));
 static void
 free_memnode_state(pTHX_ struct state *st)
 {
-    /* PERL_UNUSED_ARG(aTHX); fails for non-threaded perl */
     if (st->node_stream_fh && st->node_stream_name && *st->node_stream_name) {
         fprintf(st->node_stream_fh, "E %d %f %s\n",
-            getpid(), gettimeofday_nv()-st->start_time_nv, "unnamed");
+            getpid(), gettimeofday_nv(aTHX)-st->start_time_nv, "unnamed");
         if (*st->node_stream_name == '|') {
             if (pclose(st->node_stream_fh))
                 warn("%s exited with an error status\n", st->node_stream_name);
@@ -1428,7 +1427,7 @@ new_state(pTHX)
     if (NULL != (warn_flag = get_sv("Devel::Size::dangle", FALSE))) {
 	st->dangle_whine = SvIV(warn_flag) ? TRUE : FALSE;
     }
-    st->start_time_nv = gettimeofday_nv();
+    st->start_time_nv = gettimeofday_nv(aTHX);
     check_new(st, &PL_sv_undef);
     check_new(st, &PL_sv_no);
     check_new(st, &PL_sv_yes);
@@ -1494,7 +1493,7 @@ unseen_sv_size(pTHX_ struct state *st, pPATH)
 
 #ifdef PERL_MAD
 static void
-madprop_size(pTHX_ struct state *const st, pPath, MADPROP *prop)
+madprop_size(pTHX_ struct state *const st, pPATH, MADPROP *prop)
 {
   dPathNodes(2, NPathArg);
   if (!check_new(st, prop))
@@ -1525,7 +1524,7 @@ parser_size(pTHX_ struct state *const st, pPATH, yy_parser *parser)
   /*warn("foo: %u", parser->ps - parser->stack); */
   ADD_SIZE(st, "stack_frames", parser->stack_size * sizeof(yy_stack_frame));
   for (ps = parser->stack; ps <= parser->ps; ps++) {
-#if (PERL_BCDVERSION >= 0x5011001) /* roughly */
+#if (PERL_BCDVERSION >= 0x5011002) /* roughly */
     if (sv_size(aTHX_ st, NPathLink("compcv"), (SV*)ps->compcv, TOTAL_SIZE_RECURSION))
         ADD_LINK_ATTR(st, NPattr_NOTE, "i", ps - parser->ps);
 #else /* prior to perl 8c63ea58  Dec 8 2009 */
@@ -1657,12 +1656,14 @@ perl_size(pTHX_ struct state *const st, pPATH)
     ADD_SIZE(st, "PL_exitlist", (PL_exitlistlen * sizeof(PerlExitListEntry *))
                               + (PL_exitlistlen * sizeof(PerlExitListEntry)));
 #ifdef PERL_IMPLICIT_CONTEXT
+#ifdef PL_my_cxt_size
   if (PL_my_cxt_size && check_new(st, PL_my_cxt_list)) {
     ADD_SIZE(st, "PL_my_cxt_list", (PL_my_cxt_size * sizeof(void *)));
 #ifdef PERL_GLOBAL_STRUCT_PRIVATE
     ADD_SIZE(st, "PL_my_cxt_keys", (PL_my_cxt_size * sizeof(char *)));
 #endif
   }
+#endif
 #endif
   /* TODO PL_stashpad */
   op_size_class(aTHX_ (OP*)&PL_compiling, OPc_COP, 1, st, NPathLink("PL_compiling"));
