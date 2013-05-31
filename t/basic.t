@@ -1,16 +1,8 @@
 #!/usr/bin/perl -w
 
-use Test::More tests => 30;
+use Test::More;
 use strict;
 use Devel::SizeMe qw(size total_size);
-
-can_ok ('Devel::SizeMe', qw/
-  size
-  total_size
-  /);
-
-die ("Uhoh, test uses an outdated version of Devel::SizeMe")
-    unless is ($Devel::SizeMe::VERSION, '0.06', 'VERSION MATCHES');
 
 #############################################################################
 # some basic checks:
@@ -53,10 +45,12 @@ cmp_ok($size_1, '<', $size_2, ' ."" makes string longer');
 #############################################################################
 # check that the tracking_hash is working
 
-my($a,$b) = (1,2);
-my @ary1 = (\$a, \$a);
-my @ary2 = (\$a, \$b);
-
+my($a,$b) = ([],[]);
+my @ary1 = ($a, $a); # $a twice
+my @ary2 = ($a, $b);
+# remove the extra references held by the lexicals
+undef $a;
+undef $b;
 cmp_ok(total_size(\@ary1), '<', total_size(\@ary2),
        'the tracking hash is working');
 
@@ -171,3 +165,5 @@ sub shared_hash_keys {
 	       'Creating iteration state allocates storage');
     }
 }
+
+done_testing();

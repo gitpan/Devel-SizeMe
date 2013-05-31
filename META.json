@@ -4,7 +4,7 @@
       "unknown"
    ],
    "dynamic_config" : 1,
-   "generated_by" : "ExtUtils::MakeMaker version 6.6302, CPAN::Meta::Converter version 2.120630",
+   "generated_by" : "ExtUtils::MakeMaker version 6.66, CPAN::Meta::Converter version 2.120921",
    "license" : [
       "perl_5"
    ],
@@ -32,16 +32,20 @@
       },
       "runtime" : {
          "requires" : {
+            "DBD::SQLite" : "1.37",
             "Devel::Dwarn" : "0",
             "HTML::Entities" : "0",
             "JSON::XS" : "0",
-            "ORLite" : "0",
-            "Test::More" : "0",
+            "Moo" : "1.000007",
+            "Test::More" : "0.98",
             "XSLoader" : "0",
-            "perl" : "5.005"
+            "perl" : "5.008"
          }
       }
    },
    "release_status" : "stable",
-   "version" : "0.06"
+   "resources" : {
+      "homepage" : "https://github.com/timbunce/devel-sizeme"
+   },
+   "version" : "0.11"
 }

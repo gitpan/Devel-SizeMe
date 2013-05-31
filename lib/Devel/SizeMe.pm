@@ -7,7 +7,7 @@ BEGIN {
     if ($^P and keys %INC == 1) {
         warn "Note: Devel::SizeMe currently disables perl debugger mode\n";
         # default $^P set by "perl -d" is 0x73f
-        $^P = 0x10  # Keep info about source lines on which a sub is defined
+        $^P = 0x010 # Keep info about source lines on which a sub is defined
             | 0x100 # Provide informative "file" names for evals
             | 0x200 # Provide informative names to anonymous subroutines;
             ;
@@ -23,11 +23,11 @@ BEGIN {
 use strict;
 use vars qw($VERSION @ISA @EXPORT_OK %EXPORT_TAGS $warn $dangle);
 
-require 5.005;
+require 5.008;
 require Exporter;
 require XSLoader;
 
-$VERSION = '0.06';
+$VERSION = '0.11';
 @ISA = qw(Exporter);
 
 @EXPORT_OK = qw(size total_size perl_size heap_size);
@@ -39,7 +39,7 @@ $dangle = 0; ## Set true to enable warnings about dangling pointers
 XSLoader::load( __PACKAGE__);
 
 END {
-    Devel::SizeMe::perl_size() if $do_size_at_end; # heap_size()
+    Devel::SizeMe::heap_size() if $do_size_at_end;
 }
 
 1;
@@ -157,13 +157,22 @@ by the operating system.
 
 Far from accurate yet.
 
+=head1 GETTING HELP
+
+There's an #sizeme IRC channel on irc.perl.org and the devel-size@googlegroups.com
+mailing list (also at https://groups.google.com/d/forum/devel-size)
+
+=head1 CONTRIBUTING
+
+The source code is at https://github.com/timbunce/devel-sizeme
+
 =head1 COPYRIGHT
 
 Copyright (C) 2005 Dan Sugalski,
 Copyright (C) 2007-2008 Tels,
 Copyright (C) 2008 BrowserUK,
 Copyright (C) 2011-2012 Nicholas Clark,
-Copyright (C) 2012 Tim Bunce.
+Copyright (C) 2012-2013 Tim Bunce.
 
 This module is free software; you can redistribute it and/or modify it
 under the same terms as Perl v5.8.8.

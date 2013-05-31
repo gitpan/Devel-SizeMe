@@ -60,11 +60,10 @@ use warnings;
 use Mojolicious::Lite; # possibly needs v3
 use JSON::XS;
 use Getopt::Long;
-use Storable qw(dclone);
 use Devel::Dwarn;
 use Devel::SizeMe::Graph;
+use DBI;
 
-require ORLite;
 
 my $j = JSON::XS->new;
 
@@ -77,14 +76,9 @@ GetOptions(
 die "Can't open $opt_db: $!\n" unless -r $opt_db;
 warn "Reading $opt_db\n";
 
-# XXX currently uses ORLite but doesn't actually make use of it in any useful way
-ORLite->import({
-    file => $opt_db,
-    package => "SizeMe",
-    readonly => 1,
-    #user_version => 1, # XXX
-    #unicode => 1, # XXX
-});
+my $dbh = DBI->connect("dbi:SQLite:$opt_db", undef, undef, { RaiseError => 1 });
+my $select_node_by_id_sth = $dbh->prepare("select * from node where id = ?");
+
 
 my $static_dir = $INC{'Devel/SizeMe/Graph.pm'} or die 'panic';
 $static_dir =~ s:\.pm$:/static:;
@@ -96,11 +90,33 @@ if ( $Mojolicious::VERSION >= 2.49 ) {
 }
 
 
+sub name_path_for_node {
+    my ($id) = @_;
+    my @name_path;
+
+    while ($id) { # work backwards towards root
+        my $node = _get_node($id);
+        push @name_path, $node;
+        $id = $node->{namedby_id} || $node->{parent_id};
+        if (@name_path > 1_000) {
+            my %id_count;
+            ++$id_count{$_->{id}} for @name_path;
+            my $desc = join ", ", map { "n$_ ($id_count{$_})" } keys %id_count;
+            warn "name_path too deep (possible parent_id/namedby_id loop involving $desc)\n";
+            last;
+        }
+    }
+
+    return [ reverse @name_path ];
+}
+
+
 # Documentation browser under "/perldoc"
 plugin 'PODRenderer';
 
-get '/' => sub {
+get '/:id' => sub {
     my $self = shift;
+    # JS handles the :id
     $self->render('index');
 };
 
@@ -112,6 +128,8 @@ get '/jit_tree/:id/:depth' => sub {
     my $id = $self->stash('id');
     my $depth = $self->stash('depth');
 
+    warn "/jit_tree/$id/$depth ... \n";
+
     # hack, would be best done on the client side
     my $logarea = (defined $self->param('logarea'))
         ? $self->param('logarea')
@@ -122,7 +140,7 @@ get '/jit_tree/:id/:depth' => sub {
         my ($node) = @_;
         my $children = delete $node->{children}; # XXX edits the src tree
         my $area = $node->{self_size}+$node->{kids_size};
-        $node->{'$area'} = ($logarea) ? log($area) : $area; # XXX move to jit js
+        $node->{'$area'} = ($logarea && $area) ? log($area) : $area; # XXX move to jit js
         my $jit_node = {
             id   => $node->{id},
             name => ($node->{title} || $node->{name}).($opt_showid ? " #$node->{id}" : ""),
@@ -135,11 +153,57 @@ get '/jit_tree/:id/:depth' => sub {
     if (1){ # debug
         #use Data::Dump qw(pp);
         local $jit_tree->{children};
-        Dwarn(dclone($jit_tree)); # dclone to avoid stringification
+        require Storable;
+        Dwarn(Storable::dclone($jit_tree)); # dclone to avoid stringification
     }
 
-    $self->render_json($jit_tree);
+    my %response = (
+        name_path  => name_path_for_node($id),
+        nodes => $jit_tree
+    );
+    # XXX temp hack
+    #     //   <li><a href="#">Home</a> <span class="divider">/</span></li>
+    #     //   <li><a href="#">Library</a> <span class="divider">/</span></li>
+    #     //   <li class="active">Data</li>
+    $response{name_path_html} = join "", map {
+        sprintf q{<li><a href="/%d">%s</a><span class="divider">/</span></li>},
+            $_->{id}, $_->{name};
+    } @{$response{name_path}};
+
+    $self->render(json => \%response);
 };
+
+my %node_queue;
+my %node_cache;
+sub _set_node_queue {
+    my $nodes = shift;
+    ++$node_queue{$_} for @$nodes;
+}
+sub _get_node {
+    my $id = shift;
+
+    my $node = $node_cache{$id};
+    return $node if ref $node;
+
+    my @ids;
+    # ensure the one the caller wanted is actually in the batch
+    push @ids, $id;
+    delete $node_queue{$id};
+    # also fetch a chunk of nodes from the read-ahead list
+    while ( $_ = scalar each %node_queue ) {
+        delete $node_queue{$_};
+        push @ids, $_;
+        last if @ids > 1_000; # batch size
+    }
+
+    my $sql = "select * from node where id in (".join(",",@ids).")";
+    my $rows = $dbh->selectall_arrayref($sql);
+    for (@{ $dbh->selectall_arrayref($sql, { Slice => {} })}) {
+        $node_cache{ $_->{id} } = $_;
+    }
+
+    return $node_cache{$id};
+}
 
 
 sub _fetch_node_tree {
@@ -147,21 +211,27 @@ sub _fetch_node_tree {
 
     warn "#$id fetching\n"
         if $opt_debug;
-    my $node = SizeMe->selectrow_hashref("select * from node where id = ?", undef, $id)
-        or die "Node '$id' not found"; # shouldn't die
-    $node->{$_} += 0 for (qw(child_count kids_node_count kids_size self_size));
+
+    my $node = _get_node($id)
+        or die "No node $id";
+    $node = { %$node }; # XXX copy for inflation
+    $node->{$_} += 0 for (qw(child_count kids_node_count kids_size self_size)); # numify
     $node->{leaves} = $j->decode(delete $node->{leaves_json});
     $node->{attr}   = $j->decode(delete $node->{attr_json});
+
     $node->{name} .= "->" if $node->{type} == 2 && $node->{name};
 
     if ($node->{child_ids}) {
         my @child_ids = split /,/, $node->{child_ids};
-        my $children;
+
+        # XXX hack to handle nodes that possibly have large numbers of children
+        $depth = 1 if $depth > 1 and $node->{name} =~ /^arena|^unaccounted|^unseen/;
 
         # if this node has only one child then we merge that child into this node
         # this makes the treemap more usable
         if (@child_ids == 1
             #        && $node->{type} == 2 # only collapse links XXX
+                and $node->{name} !~ /^arena/
         ) {
             warn "#$id fetch only child $child_ids[0]\n"
                 if $opt_debug;
@@ -184,7 +254,7 @@ sub _fetch_node_tree {
                     my $dst = $child->{attr}{$attr_type} ||= {};
                     for my $k (keys %$src) {
                         warn "Node $child->{id} attr $attr_type:$k=$dst->{$k} overwritten by $src->{$k}\n"
-                            if defined $dst->{$k};
+                            if defined $dst->{$k} and $dst->{$k} ne $src->{$k};
                         $dst->{$k} = $src->{$k};
                     }
                 }
@@ -213,10 +283,20 @@ sub _fetch_node_tree {
 
             $node = $child; # use the merged child as this node
         }
+
+        if (@child_ids > 1_000) {
+            warn "Node $id ($node->{name}) has ".scalar(@child_ids)." children\n";
+            # XXX merge/prune/something?
+        }
+
+        if ($node->{name} =~ /^arena-g\d+/) {
+            warn "$node->{name} $depth";
+        }
+
         if ($depth) { # recurse to required depth
-            $children = [ map { _fetch_node_tree($_, $depth-1) } @child_ids ];
-            $node->{children} = $children;
-            $node->{child_count} = @$children;
+            _set_node_queue(\@child_ids);
+            $node->{children} = [ map { _fetch_node_tree($_, $depth-1) } @child_ids ];
+            $node->{child_count} = @{ $node->{children} };
         }
     }
     return $node;
@@ -247,52 +327,84 @@ Welcome to the Mojolicious real-time web framework!
 
 @@ layouts/default.html.ep
 <!DOCTYPE html>
+<html lang="en">
+
 <head>
 <meta http-equiv="Content-Type" content="text/html; charset=UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Perl Memory Treemap</title>
 
 <!-- CSS Files -->
 <link type="text/css" href="css/base.css" rel="stylesheet" />
 <link type="text/css" href="css/Treemap.css" rel="stylesheet" />
+<link type="text/css" href="yesmeck-jquery-jsonview/jquery.jsonview.css" rel="stylesheet" />
+<link type="text/css" href="bootstrap/css/bootstrap.min.css" rel="stylesheet" media="screen" />
+<link type="text/css" href="bootstrap/css/bootstrap-responsive.min.css" rel="stylesheet" />
 
 <!--[if IE]><script language="javascript" type="text/javascript" src="excanvas.js"></script><![endif]-->
 
-<!-- JIT Library File -->
+</head>
+
+<body>
+
+<div class="container-fluid">
+
+<div class="row-fluid">
+
+    <div class="span3" id="sizeme_left_column_div">
+
+        <div class="row-fluid">
+            <div class="span12" id="sizeme_title_div">
+                <h4>Perl Memory TreeMap</h4> 
+            </div>
+        </div>
+        <div class="row-fluid">
+            <div class="span12 text-left" id="sizeme_info_div">
+                <p class="text-left">
+                <a id="goto_parent" href="#" class="theme button white">Go to Parent</a>
+                <form name=params id="sizeme_params_form">
+                <label for="logarea">Log scale
+                <input type=checkbox id="sizeme_logarea_checkbox" name="logarea">
+                </form>
+                </p>
+            </div>
+        </div>
+        <div class="row-fluid">
+            <small>
+            <div class="span12 text-left" id="sizeme_data_div">
+            </div>
+            </small>
+        </div>
+
+    </div>
+
+    <div class="span9" id="sizeme_right_column_div">
+        <div class="row-fluid">
+            <div class="span12" id="sizeme_path_div">
+                <ul class="breadcrumb pull-left text-left" id="sizeme_path_ul">Path</ul>
+            </div>
+            <div class="span12" style="margin-left:0; text-align:center">
+                <div id="infovis"></div>
+            </div>
+        </div>
+    </div>
+</div>
+
+<div class="row-fluid">
+    <div class="span12" id="sizeme_log_div">
+        <p class="text-left" id="sizeme_log_p">Log</p>
+    </div>
+</div>
+
+</div>
+
 <script language="javascript" type="text/javascript" src="jit-yc.js"></script>
 <script language="javascript" type="text/javascript" src="jquery-1.8.1-min.js"></script>
 <script language="javascript" type="text/javascript" src="sprintf.js"></script>
 <script language="javascript" type="text/javascript" src="treemap.js"></script>
-</head>
+<script language="javascript" type="text/javascript" src="bootstrap/js/bootstrap.min.js"></script>
+<script language="javascript" type="text/javascript" src="yesmeck-jquery-jsonview/jquery.jsonview.js"></script>
+<script type="text/javascript"> $('document').ready(init) </script>
 
-<body onload="init();">
-
-<div id="container">
-
-<div id="left-container">
-
-<div class="text">
-<h4> Perl Memory TreeMap </h4> 
-    Click on a node to zoom in.<br /><br />            
-</div>
-
-<a id="back" href="#" class="theme button white">Go to Parent</a>
-<br />
-<form name=params>
-<label for="logarea">&nbsp;Logarithmic scale
-<input type=checkbox id="logarea" name="logarea">
-</form>
-
-</div>
-
-<div id="center-container">
-    <div id="infovis"></div>
-</div>
-
-<div id="right-container">
-    <div id="inner-details"></div>
-</div>
-
-<div id="log"></div>
-</div>
 </body>
 </html>
