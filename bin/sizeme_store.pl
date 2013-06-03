@@ -89,6 +89,7 @@ my @attr_type_name = (qw(size NAME PADFAKE my PADTMP NOTE ADDR REFCNT)); # XXX g
 GetOptions(
     'text!' => \my $opt_text,
     'dot=s' => \my $opt_dot,
+    'tree!' => \my $opt_tree,
     'gexf=s' => \my $opt_gexf,
     'db=s'  => \my $opt_db,
     'verbose|v+' => \my $opt_verbose,
@@ -168,18 +169,18 @@ sub leave_node {
             # elem link <- SV(PVAV) <- elem link <- PADLIST
             my $padnames = $padlist->{attr}{+NPattr_PADNAME} || [];
             if (my $padname = $padnames->[$index]) {
-                $x->{name} = "my($padname)";
+                $x->{attr}{label} = "my($padname)";
             }
             else {
-                $x->{name} = ($index) ? "PAD[$index]" : '@_';
+                $x->{attr}{label} = ($index) ? "PAD[$index]" : '@_';
             }
         }
         elsif (@stack >= 1 && ($padlist=$stack[-1])->{name} eq 'PADLIST') {
             my $padnames = $padlist->{attr}{+NPattr_PADNAME} || [];
-            $x->{name} = "Pad$index";
+            $x->{attr}{label} = "Pad$index";
         }
         else {
-            $x->{name} = "[$index]";
+            $x->{attr}{label} = "[$index]";
         }
     }
 
@@ -349,6 +350,12 @@ while (<>) {
     elsif ($type eq 'S') { # start of a run
         die "Unexpected start token" if @stack;
 
+        if ($opt_tree) {
+            my $out = Devel::SizeMe::Output::Text->new();
+            $out->start_event_stream;
+            push @outputs, $out;
+        }
+
         if ($opt_dot) {
             my $out = Devel::SizeMe::Output::Graphviz->new(file => $opt_dot);
             $out->start_event_stream;
@@ -443,6 +450,9 @@ use Moo;
 use autodie;
 use Carp qw(croak);
 use HTML::Entities qw(encode_entities);;
+
+my @attr_names = qw(label_attr size_attr kids_size_attr total_size_attr weight_attr);
+has \@attr_names => (is => 'rw');
 
 has file => (is => 'ro');
 
@@ -566,7 +576,7 @@ sub view_output {
     my $self = shift;
 
     my $file = $self->file;
-    if ($file ne '/dev/tty') {
+    if ($file && $file ne '/dev/tty') {
         system("cat $file") if $opt_debug;
     }
 }
@@ -578,7 +588,9 @@ sub enter_node {
 
 sub leave_item_node {
     my ($self, $item_node) = @_;
-    $self->emit_item_node($item_node, { label => $self->fmt_item_label($item_node) });
+    my $label = $item_node->{attr}{label};
+    $label = $item_node->{name} if not defined $label;
+    $self->emit_item_node($item_node, { label => $label });
     if (my $addr = $item_node->{attr}{addr}) {
         $self->resolve_addr_to_item($addr, $item_node);
     }
@@ -611,75 +623,85 @@ sub leave_node {
 
 BEGIN {
 
-# based on https://metacpan.org/source/SHLOMIF/Graph-Easy-0.72/lib/Graph/Easy/As_graphml.pm#L221
-# and https://metacpan.org/source/SZABGAB/SVG-2.59/lib/SVG/XML.pm#L47
-sub ::xml_escape {
-    local $_ = shift
-        or return $_;
-    #carp "xml_escape called with undef" if not defined $_;
-    
-    s/&/&amp;/g;    # quote &
-    s/>/&gt;/g;     # quote >
-    s/</&lt;/g;     # quote <
-    s/"/&quot;/g;   # quote "
-    s/'/&apos;/g;   # quote '
-    s/\\\\/\\/g;    # "\\" to "\"
+package Devel::SizeMe::Output::Text;
 
-    # Invalid XML characters are removed and warned about
-    # Tabs (\x09) and newlines (\x0a) are valid.
-    while ( s/([\x00-\x08\x0b\x1f])// ) {
-        my $char = "'\\x".sprintf('%02X',ord($1))."'";
-        Carp::carp("Removed $char from xml");
-    }
-    s/([\200-\377])/'&#'.ord($1).';'/ge;
-
-    return $_;
-}
-
-
-{
-package # hide from PAUSE
-    graphml::attr;
 use Moo;
-use Carp;
-my $next_id = 0;
-my %by_name;
+use autodie;
+use Carp qw(croak);
+use Devel::Dwarn;
+use HTML::Entities qw(encode_entities);;
 
-# graph, node, edge, or all
-has for => ( is=>'ro', required=>1 );
-# boolean, int, long, float, double, or string are supported by gephi
-has type => ( is=>'ro', required=>1 );
-has name => ( is=>'ro', required=>1 );
-has default => ( is=>'ro' );
-has key => ( is=>'rw' );
+extends 'Devel::SizeMe::Output';
+
+has fh => (is => 'rw');
+
+my @buffered_edges;
+
+*fmt_size = \&main::fmt_size;
 
 sub BUILD {
     my $self = shift;
-    croak "Duplicate attribute name ".$self->name
-        if $by_name{ $self->name };
-    $by_name{ $self->name } = $self;
-    $next_id++;
-    $self->key( ($self->name =~ m/^\w+$/) ? $self->name : "a$next_id")
-        unless defined $self->key;
+    @buffered_edges = ();
 }
 
-sub fmt_data_key_declaration {
+sub create_output {
     my $self = shift;
-
-    my $default = '';
-    $default = sprintf "<default>%s</default>", ::xml_escape($self->default)
-        if defined $self->default;
-
-    return sprintf qq{\t<key id="%s" for="%s" attr.name="%s" attr.type="%s">%s</key>\n},
-        $self->key, $self->for, $self->name, $self->type, $default;
+    $self->fh(\*STDOUT);
+    $self->fh->autoflush if $opt_debug;
 }
 
-sub fmt_data {
-    my ($self, $value) = @_;
-    return sprintf qq{<data key="%s">%s</data>}, $self->key, ::xml_escape($value);
+sub close_output {
+    my $self = shift;
+    $self->fh(undef);
 }
 
+sub leave_node {
+    my ($self, $node) = @_;
+    my $fh = $self->fh or return;
+
+    my $size_str = sprintf "%s+%s=%s",
+        fmt_size($node->{self_size}),
+        fmt_size($node->{kids_size}),
+        fmt_size($node->{self_size}+$node->{kids_size});
+    my $pad = $indent x $node->{depth};
+
+    printf "%s%s", $pad, $node->{name};
+
+    printf q{ "%s"}, _escape($node->{attr}{label})
+        if exists $node->{attr}{label};
+
+    printf " --^" if ($node->{type} == ::NPtype_LINK);
+
+    printf " [#%d @%d] %s\n", $node->{id}, $node->{depth}, $size_str;
+
+    our $j ||= JSON::XS->new->ascii->pretty(0);
+    printf "%s `attr %s\n", $pad, $j->encode($node->{attr})
+        if keys %{$node->{attr}};
+    print "$pad\n";
 }
+
+
+sub write_pending_links {
+    print "write_pending_links skipped\n";
+}
+
+sub write_dangling_links {
+    print "write_dangling_links skipped\n";
+}
+
+sub _escape {
+    local $_ = shift;
+    return "" if not defined $_;
+    # escape unprintables XXX correct sins against unicode
+    s/([\000-\037\200-\237])/sprintf("\\x%02x",ord($1))/eg;
+    return $_;
+}
+
+} # END Text
+
+
+
+BEGIN {
 
 package Devel::SizeMe::Output::GEXF;
 # http://gexf.net/format/index.html
@@ -691,11 +713,7 @@ use HTML::Entities qw(encode_entities);;
 
 extends 'Devel::SizeMe::Output';
 
-
 has fh => (is => 'rw');
-
-my @attr_names = qw(label_attr size_attr kids_size_attr total_size_attr weight_attr);
-has \@attr_names => (is => 'rw');
 
 my @buffered_edges;
 
@@ -703,12 +721,6 @@ my @buffered_edges;
 
 sub BUILD {
     my $self = shift;
-
- #   $self->label_attr( graphml::attr->new(for=>'all', type=>'string', name=>'label', key=>"d3"));
- #   $self->size_attr( graphml::attr->new(for=>'node', type=>'int', name=>'size'));
- #   $self->kids_size_attr( graphml::attr->new(for=>'node', type=>'int', name=>'kids_size'));
- #   $self->total_size_attr( graphml::attr->new(for=>'node', type=>'int', name=>'total_size'));
- #   $self->weight_attr( graphml::attr->new(for=>'edge', type=>'double', name=>'weight', key=>'weight'));
     @buffered_edges = ();
 }
 
@@ -730,11 +742,7 @@ sub view_output {
     $self->SUPER::view_output(@_);
 
     my $file = $self->file;
-    if ($file ne '/dev/tty') {
-        #system("dot -Tsvg $file > sizeme.svg && open sizeme.svg");
-        #system("open sizeme.html") if $^O eq 'darwin'; # OSX
-        system("open -a Graphviz $file") if $^O eq 'darwin'; # OSX
-    }
+    system("open -a Gephi $file") if $^O eq 'darwin'; # OSX
 }
 
 sub write_prologue {
@@ -755,6 +763,7 @@ sub write_prologue {
     print $fh qq{<graph defaultedgetype="directed">
         <attributes class="node" type="static">
         <attribute id="label" title="label" type="string"/>
+        <attribute id="name" title="name" type="string"/>
         <attribute id="nsb" title="self_bytes" type="int"/>
         <attribute id="nkb" title="kids_bytes" type="int"/>
         <attribute id="ntb" title="total_bytes" type="int"/>
@@ -799,8 +808,7 @@ sub emit_link {
     else {
         push @link_attr, ($attr->{hard}) ? () : ('style="dashed"');
     }
-    (my $link_name = $link_node->{attr}{label} || $link_node->{name}) =~ s/->$//; # XXX hack
-    push @link_attr, (sprintf "label=%s", _dotlabel($link_name, $link_node));
+    my $link_name = $link_node->{attr}{label} || $link_node->{name};
 
     my $label = _dotlabel($link_name, $link_node),
     my $weight = 1;
@@ -842,9 +850,10 @@ sub emit_item_node {
         nkb => $item_node->{kids_size},
         ntb => $item_node->{self_size}+$item_node->{kids_size},
         nrc => $item_node->{refcnt},
+        name => $item_node->{name},
     );
     my %viz;
-    my $label = _dotlabel($attr->{label}, $item_node);
+    my $label = _dotlabel($attr->{label}||$item_node->{name}, $item_node);
     $self->_emit_node($item_node->{id}, $label, \%attr, \%viz);
 }
 
@@ -866,16 +875,6 @@ sub fmt_item_label {
     push @name, "\"$item_node->{attr}{label}\""
         if $item_node->{attr}{label};
     push @name, $item_node->{name};
-    if ($item_node->{kids_size}) {
-        push @name, sprintf " %s+%s=%s",
-            fmt_size($item_node->{self_size}),
-            fmt_size($item_node->{kids_size}),
-            fmt_size($item_node->{self_size}+$item_node->{kids_size});
-    }
-    else {
-        push @name, sprintf " +%s",
-            fmt_size($item_node->{self_size});
-    }
     return \@name;
 }
 
@@ -1144,6 +1143,32 @@ sub fmt_item_label {
 }
 
 } # END
+
+
+# based on https://metacpan.org/source/SHLOMIF/Graph-Easy-0.72/lib/Graph/Easy/As_graphml.pm#L221
+# and https://metacpan.org/source/SZABGAB/SVG-2.59/lib/SVG/XML.pm#L47
+sub ::xml_escape {
+    local $_ = shift
+        or return $_;
+    #carp "xml_escape called with undef" if not defined $_;
+
+    s/&/&amp;/g;    # quote &
+    s/>/&gt;/g;     # quote >
+    s/</&lt;/g;     # quote <
+    s/"/&quot;/g;   # quote "
+    s/'/&apos;/g;   # quote '
+    s/\\\\/\\/g;    # "\\" to "\"
+
+    # Invalid XML characters are removed and warned about
+    # Tabs (\x09) and newlines (\x0a) are valid.
+    while ( s/([\x00-\x08\x0b\x1f])// ) {
+        my $char = "'\\x".sprintf('%02X',ord($1))."'";
+        Carp::carp("Removed $char from xml");
+    }
+    s/([\200-\377])/'&#'.ord($1).';'/ge;
+
+    return $_;
+}
 
 
 =for This is out of date but gives you an idea of the data and stream

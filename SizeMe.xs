@@ -201,7 +201,7 @@ struct state {
             if(st->trace_level>=9)fprintf(stderr,"dNPathNodes (%d, %p)\n", nodes, prev_np);\
             NP->seqn = NP->type = 0; NP->id = Nullch; /* safety/debug */ \
             NP->prev = prev_np
-#define NPathPushNode(nodeid, nodetype) \
+#define _NPathPushNode(nodeid, nodetype) \
     STMT_START { \
             NP->id = nodeid; \
             NP->type = nodetype; \
@@ -213,17 +213,33 @@ struct state {
             NP->type = 0; \
             NP->prev = (NP-1); \
     } STMT_END
+#define NPathPushNode(nodeid, nodetype) \
+    STMT_START { \
+        assert(nodetype != NPtype_LINK); \
+        /* ensure that we hang a non-link on a link */ \
+        assert(!NP->prev || NP->prev->type == NPtype_LINK); \
+        _NPathPushNode(nodeid, nodetype); \
+    } STMT_END
+#define NPathPushPlaceholderNode \
+    STMT_START { \
+        _NPathPushNode((void*)0xAB, NPtype_PLACEHOLDER); /* poison */ \
+    } STMT_END
+#define NPathPushLink(nodeid) \
+    STMT_START { \
+        /* ensure that we don't hang a link on a link */ \
+        assert(NP->prev && NP->prev->type != NPtype_LINK); \
+        _NPathPushNode(nodeid, NPtype_LINK); \
+    } STMT_END
+
+
 #define NPathSetNode(nodeid, nodetype) \
     STMT_START { \
+            assert(nodetype != NPtype_LINK); \
+            assert((NP-1)->seqn /* was output */ || (NP-1)->type == NPtype_PLACEHOLDER); \
             (NP-1)->id = nodeid; \
             (NP-1)->type = nodetype; \
             if(st->trace_level>=9)fprintf(stderr,"NPathSetNode (%p <-) %p <- [%d %p]\n", (NP-1)->prev, (NP-1), nodetype,nodeid);\
             (NP-1)->seqn = 0; \
-    } STMT_END
-#define NPathSetNodeIfChanged(nodeid, nodetype) \
-    STMT_START { \
-        if (strNE(nodeid, (NP-1)->id) || nodetype != (NP-1)->type) \
-            NPathSetNode(nodeid, nodetype); \
     } STMT_END
 #define NPathPopNode \
     STMT_START { \
@@ -242,6 +258,7 @@ struct state {
 #define NPtype_SV       0x03
 #define NPtype_MAGIC    0x04
 #define NPtype_OP       0x05
+#define NPtype_PLACEHOLDER  0x06
 
 /* XXX these should probably be generalized into flag bits */
 #define NPattr_LEAFSIZE 0x00
@@ -389,6 +406,9 @@ np_print_node_name(pTHX_ FILE *fp, npath_node_t *npath_node)
         break;
     case NPtype_NAME:
         fprintf(fp, "%s", (const char *)npath_node->id);
+        break;
+    case NPtype_PLACEHOLDER:
+        croak("Unset placeholder encountered");
         break;
     default:    /* assume id is a string pointer */
         fprintf(fp, "UNKNOWN(%d,%p)", npath_node->type, npath_node->id);
@@ -561,13 +581,16 @@ np_stream_node_path_info(pTHX_ struct state *st, npath_node_t *npath_node, UV at
 #endif /* PATH_TRACKING */
 
 
+#define check_new(st, p)    _check_new(st, p, 1)
+#define not_yet_sized(st, p)  _check_new(st, p, 0)
+
 /* 
     Checks to see if thing is in the bitstring. 
-    Returns true or false, and
-    notes thing in the segmented bitstring.
+    Returns true or false, AND
+    notes thing in the segmented bitstring if record is true
  */
 static bool
-check_new(struct state *st, const void *const p) {
+_check_new(struct state *st, const void *const p, bool record) {
     unsigned int bits = 8 * sizeof(void*);
     const size_t raw_p = PTR2nat(p);
     /* This effectively rotates the value right by the number of low always-0
@@ -625,7 +648,8 @@ check_new(struct state *st, const void *const p) {
     if(leaf[i] & this_bit)
 	return FALSE;
 
-    leaf[i] |= this_bit;
+    if (record)
+        leaf[i] |= this_bit;
     return TRUE;
 }
 
@@ -643,7 +667,7 @@ get_sv_follow_state(pTHX_ struct state *st, const SV *const sv)
     /* For SVs we defer calling check_new() until we've 'seen' the SV
      * at least as often as the reference count. 
      */
-    if (SvREFCNT(sv) <= 1 || sv == st->sv_refcnt_to_ignore) {
+    if (SvREFCNT(sv) <= 1 || sv == st->sv_refcnt_to_ignore || SvIMMORTAL(sv)) {
         return (check_new(st, sv)) ? FOLLOW_SINGLE_NOW : FOLLOW_SINGLE_DONE;
     }
 
@@ -886,8 +910,7 @@ magic_size(pTHX_ const SV * const thing, struct state *st, pPATH) {
   dNPathNodes(1, NPathArg);
   MAGIC *magic_pointer = SvMAGIC(thing); /* caller ensures thing is SvMAGICAL */
 
-  /* push a dummy node for NPathSetNode to update inside the while loop */
-  NPathPushNode("dummy", NPtype_NAME);
+  NPathPushPlaceholderNode;
 
   /* Have we seen the magic pointer?  (NULL has always been seen before)  */
   while (check_new(st, magic_pointer)) {
@@ -976,7 +999,7 @@ regex_size(pTHX_ const REGEXP * const baseregex, struct state *st, pPATH) {
     dNPathNodes(1, NPathArg);
     if(!check_new(st, baseregex))
 	return;
-  NPathPushNode("regex_size", NPtype_NAME);
+  NPathPushNode("REGEXP", NPtype_NAME);
   ADD_SIZE(st, "REGEXP", sizeof(REGEXP));
 #if (PERL_VERSION < 11)     
   /* Note the size of the paren offset thing */
@@ -1010,7 +1033,7 @@ hek_size(pTHX_ struct state *st, HEK *hek, U32 shared, pPATH)
 	return 0;
     }
     if (use_node_for_hek) {
-        NPathPushNode((shared)?"hek-shared":"hek", NPtype_NAME);
+        NPathPushNode((shared)?"HEK.shared":"hek", NPtype_NAME);
         ADD_ATTR(st, NPattr_ADDR, "", PTR2UV(hek));
 
     }
@@ -1040,11 +1063,12 @@ refcounted_he_size(pTHX_ struct state *st, struct refcounted_he *he, pPATH)
   dNPathNodes(1, NPathArg);
   if (!check_new(st, he))
     return;
-  NPathPushNode("refcounted_he_size", NPtype_NAME);
+  /* see Perl_refcounted_he_new() in hv.c */
+  NPathPushNode("refcounted_he", NPtype_NAME);
   ADD_SIZE(st, "refcounted_he", sizeof(struct refcounted_he));
 
 #ifdef USE_ITHREADS
-  ADD_SIZE(st, "refcounted_he_data", NPtype_NAME);
+  ADD_SIZE(st, "refcounted_he_data", he->refcounted_he_keylen);
 #else
   hek_size(aTHX_ st, he->refcounted_he_hek, 0, NPathLink("refcounted_he_hek"));
 #endif
@@ -1371,17 +1395,11 @@ padlist_size(pTHX_ struct state *const st, pPATH, PADLIST *padl)
     }
     sv_size(aTHX_ st, NPathLink("PadlistNAMES"), (SV*)PadlistNAMES(padl));
 
-if (0) {
-    do_dump_pad(0, Perl_debug_log, padl, 1);
-    do_sv_dump(0, Perl_debug_log, (SV*)PadlistNAMES(padl), 0, 4, 0, 0);
-}
-
     ix = PadlistMAX(padl) + 1;
     ADD_SIZE(st, "PADs", sizeof(PAD*) * ix);
 
     for (ix = 1; ix <= PadlistMAX(padl); ix++) {
 	if (sv_size(aTHX_ st, NPathLink("elem"), (SV*)PadlistARRAY(padl)[ix]))
-1;
             ADD_LINK_ATTR_TO_TOP(st, NPattr_NOTE, "i", ix);
     }
 
@@ -1448,8 +1466,6 @@ sv_size(pTHX_ struct state *const st, pPATH, const SV * const orig_thing)
             ADD_LINK_ATTR_TO_PREV(st, NPattr_ADDR, "", PTR2UV(thing));
         return 0;
   case FOLLOW_MULTI_DEFER:
-        if (SvIMMORTAL(thing)) /* avoid clutter from links to immortals */
-            return 0;
         ADD_LINK_ATTR_TO_PREV(st, NPattr_ADDR, "", PTR2UV(thing));
         if (get_sv_follow_seencnt(aTHX_ st, thing) == 1) {
             ADD_LINK_ATTR_TO_PREV(st, NPattr_LABEL, svtypename(thing), 0);
@@ -1548,8 +1564,8 @@ sv_size(pTHX_ struct state *const st, pPATH, const SV * const orig_thing)
             HEK *hek = cur_entry->hent_hek;
 
             if (!(st->hide_detail & NPf_DETAIL_HEK)) {
-                NPathPushNode("he", NPtype_LINK);
-                NPathPushNode("he+hek", NPtype_NAME);
+                NPathPushLink("HE");
+                NPathPushNode("HE", NPtype_NAME);
             }
 
             ADD_SIZE(st, "he", sizeof(HE));
@@ -1560,14 +1576,10 @@ sv_size(pTHX_ struct state *const st, pPATH, const SV * const orig_thing)
             }
             else {
                 if (sv_size(aTHX_ st, NPathLink("HeVAL"), HeVAL(cur_entry))) {
-                    char buf[20];
-                    /* XXX make this the NPattr_LABEL of the HeVAL link if not showing detail */
                     /* give a safe short hint of the key string */
-                    pv_pretty(st->tmp_sv, HEK_KEY(hek), HEK_LEN(hek), sizeof(buf)-(3+2+1),
+                    pv_pretty(st->tmp_sv, HEK_KEY(hek), HEK_LEN(hek), 20,
                         NULL, NULL, PERL_PV_ESCAPE_NONASCII|PERL_PV_PRETTY_ELLIPSES);
-                    buf[0] = '{';
-                    strcpy(stpcpy(&buf[1], SvPVX(st->tmp_sv)), "}");
-                    ADD_LINK_ATTR_TO_TOP(st, NPattr_LABEL, buf, 0);
+                    ADD_LINK_ATTR_TO_TOP(st, NPattr_LABEL, SvPVX(st->tmp_sv), 0);
                 }
             }
 
@@ -1765,7 +1777,7 @@ free_memnode_state(pTHX_ struct state *st)
         fprintf(st->node_stream_fh, "E %d %f %s\n",
             getpid(), gettimeofday_nv(aTHX)-st->start_time_nv, "unnamed");
         if (*st->node_stream_name == '|') {
-            if (pclose(st->node_stream_fh))
+            if (pclose(st->node_stream_fh)) /* XXX PerlIO! */
                 warn("%s exited with an error status\n", st->node_stream_name);
         }
         else {
@@ -1879,8 +1891,8 @@ unseen_sv_size(pTHX_ struct state *st, pPATH)
                 if (SvTYPE(sv) != (svtype)SVTYPEMASK && SvREFCNT(sv)) {
                     /* is a live SV */
                     if (SvTYPE(sv) == want_type) {
-                        /* TODO optimize by checking if sv has been seen first */
-                        NPathPushNode(path_link_group, NPtype_LINK);
+                        /* TODO optimize by checking not_yet_sized first */
+                        NPathPushLink(path_link_group);
                         NPathPushNode(path_link_group, NPtype_NAME);
                         if (sv_size(aTHX_ st, NPathLink("arena"), sv)) {
                             /* TODO - resolve these 'unseen' SVs by expanding the coverage of perl_size() */
@@ -1894,14 +1906,9 @@ unseen_sv_size(pTHX_ struct state *st, pPATH)
                         NPathPopNode;
                         NPathPopNode;
                     }
-                    continue;
                 }
-                /* dead SV */
-                if (check_new(st, sv)) { /* sanity check */
-                    fprintf(stderr, "unseen_sv_size encountered freed SV unexpectedly at ");
-                    np_dump_node_path(aTHX_ st, NP);
-                    fprintf(stderr, ": ");
-                    sv_dump(sv);
+                else { /* is a dead SV */
+                    /* will be sized via PL_sv_root later */
                 }
             }
 
@@ -1956,7 +1963,7 @@ deferred_by_refcnt_size(pTHX_ struct state *st, pPATH, int cycle)
     NPathPopNode;
 
     if (st->trace_level)
-        fprintf(stderr, "visited %d deferred SVs on cycle %d\n", visited, cycle);
+        fprintf(stderr, "visited %lu deferred SVs on cycle %d\n", visited, cycle);
 
     return visited;
 }
@@ -1968,7 +1975,7 @@ madprop_size(pTHX_ struct state *const st, pPATH, MADPROP *prop)
   dNPathNodes(2, NPathArg);
   if (!check_new(st, prop))
     return;
-  NPathPushNode("madprop", NPtype_NAME);
+  NPathPushNode("MADPROP", NPtype_NAME);
   ADD_SIZE(st, "MADPROP", sizeof(MADPROP));
   ADD_SIZE(st, "val", prop->mad_vlen);
   /* XXX recurses, so should perhaps be handled like op_size to avoid the chain */
@@ -1981,17 +1988,17 @@ madprop_size(pTHX_ struct state *const st, pPATH, MADPROP *prop)
 static void
 parser_size(pTHX_ struct state *const st, pPATH, yy_parser *parser)
 {
+  yy_stack_frame *ps;
   dNPathNodes(2, NPathArg);
   if (!check_new(st, parser))
     return;
-  NPathPushNode("parser", NPtype_NAME);
+  NPathPushNode("yy_parser", NPtype_NAME);
   ADD_SIZE(st, "yy_parser", sizeof(yy_parser));
 
+  NPathPushLink("stack");
   NPathPushNode("stack", NPtype_NAME);
-  yy_stack_frame *ps;
-  /*warn("total: %u", parser->stack_size); */
-  /*warn("foo: %u", parser->ps - parser->stack); */
-  ADD_SIZE(st, "stack_frames", parser->stack_size * sizeof(yy_stack_frame));
+  ADD_SIZE(st, "yy_stack_frames", parser->stack_size * sizeof(yy_stack_frame));
+  ADD_ATTR(st, NPattr_NOTE, "n", parser->stack_size);
   for (ps = parser->stack; ps <= parser->ps; ps++) {
 #if (PERL_BCDVERSION >= 0x5011002) /* roughly */
     if (sv_size(aTHX_ st, NPathLink("compcv"), (SV*)ps->compcv))
@@ -2001,6 +2008,7 @@ parser_size(pTHX_ struct state *const st, pPATH, yy_parser *parser)
         ADD_LINK_ATTR_TO_TOP(st, NPattr_NOTE, "i", ps - parser->ps);
 #endif
   }
+  NPathPopNode;
   NPathPopNode;
 
   sv_size(aTHX_ st, NPathLink("lex_repl"), (SV*)parser->lex_repl);
@@ -2021,20 +2029,21 @@ parser_size(pTHX_ struct state *const st, pPATH, yy_parser *parser)
   sv_size(aTHX_ st, NPathLink("thiswhite"), parser->thiswhite);
 #endif
   op_size_class(aTHX_ (OP*)parser->saved_curcop, OPc_COP, 0,
-		st, NPathLink("saved_curcop"));
+		st, NPathLinkAndNode("saved_curcop", "OPs"));
 
   if (parser->old_parser)
     parser_size(aTHX_ st, NPathLink("old_parser"), parser->old_parser);
 }
 #endif
 
+
 static void
 perl_size(pTHX_ struct state *const st, pPATH)
 {
-  dNPathNodes(3, NPathArg);
+  dNPathNodes(5, NPathArg); /* extra levels for NPathLinkAndNode etc */
 
   /* if(!check_new(st, interp)) return; */
-  NPathPushNode("perl", NPtype_NAME);
+  NPathPushNode("PerlInterpreter", NPtype_NAME);
 #if defined(MULTIPLICITY)
   ADD_SIZE(st, "PerlInterpreter", sizeof(PerlInterpreter));
 #endif
@@ -2047,6 +2056,7 @@ perl_size(pTHX_ struct state *const st, pPATH)
   /* start with PL_defstash to get everything reachable from \%main:: */
   sv_size(aTHX_ st, NPathLink("PL_defstash"), (SV*)PL_defstash);
 
+  NPathPushLink("others");
   NPathPushNode("others", NPtype_NAME); /* group these (typically much smaller) items */
   sv_size(aTHX_ st, NPathLink("PL_defgv"), (SV*)PL_defgv);
   sv_size(aTHX_ st, NPathLink("PL_incgv"), (SV*)PL_incgv);
@@ -2070,8 +2080,8 @@ perl_size(pTHX_ struct state *const st, pPATH)
   sv_size(aTHX_ st, NPathLink("PL_diehook"), (SV*)PL_diehook);
   sv_size(aTHX_ st, NPathLink("PL_endav"), (SV*)PL_endav);
   sv_size(aTHX_ st, NPathLink("PL_main_cv"), (SV*)PL_main_cv);
-  sv_size(aTHX_ st, NPathLink("PL_main_root"), (SV*)PL_main_root);
-  sv_size(aTHX_ st, NPathLink("PL_main_start"), (SV*)PL_main_start);
+  /*sv_size(aTHX_ st, NPathLink("PL_main_root"), (SV*)PL_main_root); is OP? */
+  /*sv_size(aTHX_ st, NPathLink("PL_main_start"), (SV*)PL_main_start); is OP? */
   sv_size(aTHX_ st, NPathLink("PL_envgv"), (SV*)PL_envgv);
   sv_size(aTHX_ st, NPathLink("PL_hintgv"), (SV*)PL_hintgv);
   sv_size(aTHX_ st, NPathLink("PL_e_script"), (SV*)PL_e_script);
@@ -2154,8 +2164,8 @@ perl_size(pTHX_ struct state *const st, pPATH)
     /* XXX ??? */
 #endif
 
-  op_size_class(aTHX_ (OP*)&PL_compiling, OPc_COP, 1, st, NPathLink("PL_compiling"));
-  op_size_class(aTHX_ (OP*)PL_curcopdb, OPc_COP, 0, st, NPathLink("PL_curcopdb"));
+  op_size_class(aTHX_ (OP*)&PL_compiling, OPc_COP, 1, st, NPathLinkAndNode("PL_compiling", "OPs"));
+  op_size_class(aTHX_ (OP*)PL_curcopdb, OPc_COP, 0, st, NPathLinkAndNode("PL_curcopdb", "OPs"));
 
 #if (PERL_BCDVERSION >= 0x5009005)
   parser_size(aTHX_ st, NPathLink("PL_parser"), PL_parser);
@@ -2201,24 +2211,7 @@ perl_size(pTHX_ struct state *const st, pPATH)
   /* --- by this point we should have seen all reachable SVs --- */
 
   /* in theory we shouldn't have any elements in PL_strtab that haven't been seen yet */
-  sv_size(aTHX_ st, NPathLink("PL_strtab-unseen"), (SV*)PL_strtab);
-
-  /* unused space in sv head arenas */
-  if (PL_sv_root) {
-    SV *p = PL_sv_root;
-    UV free_heads = 1;
-#  define SvARENA_CHAIN(sv)     SvANY(sv) /* XXX breaks encapsulation*/
-    while ((p = MUTABLE_SV(SvARENA_CHAIN(p)))) {
-        if (!check_new(st, p)) /* sanity check */
-            warn("Free'd SV head unexpectedly already seen");
-        ++free_heads;
-    }
-    NPathPushNode("unused_sv_heads", NPtype_NAME);
-    ADD_SIZE(st, "sv", free_heads * sizeof(SV));
-    ADD_ATTR(st, NPattr_NOTE, "n", free_heads);
-    NPathPopNode;
-  }
-  /* XXX iterate over bodies_by_type and crawl the free chains for each */
+  sv_size(aTHX_ st, NPathLink("PL_strtab.unseen"), (SV*)PL_strtab);
 
   /* iterate over our sv_refcnt_ptr_table looking for any SVs that haven't been */
   /* seen as often as their refcnt and follow them now */
@@ -2237,13 +2230,40 @@ perl_size(pTHX_ struct state *const st, pPATH)
   /* iterate over all SVs to find any we've not accounted for yet */
   /* once the code above is visiting all SVs, any found here have been leaked */
   unseen_sv_size(aTHX_ st, NPathLink("unaccounted"));
+
+  NPathPopNode; /* others node */
+  NPathPopNode; /* others link */
+
+  NPathPushLink("freed");
+  NPathPushNode("freed", NPtype_NAME);
+
+  /* unused space in sv head arenas */
+  if (PL_sv_root) {
+    SV *p = PL_sv_root;
+    UV free_heads = 1;
+#  define SvARENA_CHAIN(sv)     SvANY(sv) /* XXX breaks encapsulation*/
+    while ((p = MUTABLE_SV(SvARENA_CHAIN(p)))) {
+        if (!check_new(st, p)) /* sanity check */
+            warn("Free'd SV head 0x%p unexpectedly already seen", p);
+        ++free_heads;
+    }
+    NPathPushLink("SvARENA_CHAIN");
+    NPathPushNode("free_sv_heads", NPtype_NAME);
+    ADD_SIZE(st, "sv", free_heads * sizeof(SV));
+    ADD_ATTR(st, NPattr_NOTE, "n", free_heads);
+    NPathPopNode;
+    NPathPopNode;
+  }
+
+  /* XXX iterate over bodies_by_type and crawl the free chains for each */
+
 }
 
 
 static void
 malloc_free_size(pTHX_ struct state *const st, pPATH)
 {
-    dNPathNodes(1, NPathArg);
+    dNPathNodes(3, NPathArg);
 
 # ifdef _MALLOC_MALLOC_H_ /* OSX. Not sure where else mstats is available */
 # define HAS_MSTATS
@@ -2252,18 +2272,27 @@ malloc_free_size(pTHX_ struct state *const st, pPATH)
     /* some systems have the SVID2/XPG mallinfo structure and function */
     struct mstats ms = mstats(); /* mstats() first */
 # endif
+    NPathPushNode("malloc", NPtype_NAME);
 
 # ifdef HAS_MSTATS
-    NPathPushNode("free_malloc_space", NPtype_NAME);
+    NPathPushLink("bytes_free");
+    NPathPushNode("bytes_free", NPtype_NAME);
     ADD_SIZE(st, "bytes_free", ms.bytes_free);
     ADD_ATTR(st, NPattr_NOTE, "bytes_total", ms.bytes_total);
     ADD_ATTR(st, NPattr_NOTE, "bytes_used",  ms.bytes_used);
     ADD_ATTR(st, NPattr_NOTE, "chunks_used", ms.chunks_used);
     ADD_ATTR(st, NPattr_NOTE, "chunks_free", ms.chunks_free);
+    NPathPopNode;
+    NPathPopNode;
+
     /* TODO get heap size from OS and add a node: unknown = heapsize - perl - ms.bytes_free */
     /* for now we use bytes_total as an approximation */
-    NPathSetNode("unknown", NPtype_NAME);
+    NPathPushLink("unknown");
+    NPathPushNode("unknown", NPtype_NAME);
     ADD_SIZE(st, "unknown", ms.bytes_total - st->total_size);
+    NPathPopNode;
+    NPathPopNode;
+
 # else
     ADD_LINK_ATTR_TO_PREV(st, NPattr_NOTE, "no_malloc_info", 0);
     /* XXX ? */
