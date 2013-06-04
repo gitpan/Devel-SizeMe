@@ -1023,10 +1023,6 @@ hek_size(pTHX_ struct state *st, HEK *hek, U32 shared, pPATH)
     int use_node_for_hek = !(st->hide_detail & NPf_DETAIL_HEK);
 
     /* Hash keys can be shared. Have we seen this before? */
-    /* XXX when shared is true we could perhaps to allocate
-     * (size of the hek / shared_he_he.he_valu.hent_refcount)
-     * rather than let the first use of the key carry the cost
-     */
     if (!check_new(st, hek)) {
         if (use_node_for_hek)
             ADD_LINK_ATTR_TO_PREV(st, NPattr_ADDR, "", PTR2UV(hek));
@@ -1045,13 +1041,17 @@ hek_size(pTHX_ struct state *st, HEK *hek, U32 shared, pPATH)
 #else
 	+ 2
 #endif
-	);
+    );
     if (shared) {
 #if PERL_VERSION < 10
 	ADD_SIZE(st, "he", sizeof(struct he));
 #else
 	ADD_SIZE(st, "shared_he", STRUCT_OFFSET(struct shared_he, shared_he_hek));
 #endif
+        /* XXX when shared is true we could perhaps to allocate
+        * (size of the hek / shared_he_he.he_valu.hent_refcount)
+        * rather than let the first use of the key carry the cost
+        */
     }
     return 1;
 }
@@ -1552,6 +1552,9 @@ sv_size(pTHX_ struct state *const st, pPATH, const SV * const orig_thing)
 #else
     if (HvNAME(thing))  { ADD_ATTR(st, NPattr_LABEL, HvNAME(thing), 0); }
 #endif
+    if (orig_thing == (SV*)PL_strtab) {
+        ADD_ATTR(st, NPattr_LABEL, "PL_strtab", 0);
+    }
     ADD_SIZE(st, "hv_max", (sizeof(HE *) * (HvMAX(thing) + 1)));
     /* Now walk the bucket chain */
     if (HvARRAY(thing)) {
@@ -1850,7 +1853,7 @@ new_state(pTHX_ SV *root_sv)
 }
 
 
-/* XXX based on S_visit() in sv.c */
+/* based on S_visit() in sv.c */
 static void
 unseen_sv_size(pTHX_ struct state *st, pPATH)
 {
@@ -1932,8 +1935,9 @@ deferred_by_refcnt_size(pTHX_ struct state *st, pPATH, int cycle)
     if (st->trace_level)
         fprintf(stderr, "sweeping probable ref loops, cycle %d\n", cycle);
 
+    NPathPushNode("cycle", NPtype_NAME);
     sprintf(node_name, "cycle-%d", cycle);
-    NPathPushNode(node_name, NPtype_NAME);
+    ADD_ATTR(st, NPattr_LABEL, node_name, 0);
 
     /* visit each item in sv_refcnt_ptr_table */
     /* TODO ought to be abstracted and moved into smptr_tbl.c */
@@ -2216,15 +2220,16 @@ perl_size(pTHX_ struct state *const st, pPATH)
   /* iterate over our sv_refcnt_ptr_table looking for any SVs that haven't been */
   /* seen as often as their refcnt and follow them now */
   if (1) {
-    int ref_loop_cycle = 0;
-    char name[20];
-    /* if we visited any SVs then try again since we may have encountered some
+    int cycle = 0;
+    NPathPushLink("ref_loops");
+    NPathPushNode("ref_loops", NPtype_NAME);
+    /* loop so that if we visited any SVs then try again since we may have encountered some
      * more SVs that haven't been visited yet
      */
-    do {
-        ++ref_loop_cycle;
-        sprintf(name, "ref_loops_%d", ref_loop_cycle);
-    } while (deferred_by_refcnt_size(aTHX_ st, NPathLink(name), ref_loop_cycle));
+    while (deferred_by_refcnt_size(aTHX_ st, NPathLink("ref_loops"), ++cycle))
+        1;
+    NPathPopNode;
+    NPathPopNode;
   }
 
   /* iterate over all SVs to find any we've not accounted for yet */
@@ -2247,7 +2252,7 @@ perl_size(pTHX_ struct state *const st, pPATH)
             warn("Free'd SV head 0x%p unexpectedly already seen", p);
         ++free_heads;
     }
-    NPathPushLink("SvARENA_CHAIN");
+    NPathPushLink("free_sv_heads");
     NPathPushNode("free_sv_heads", NPtype_NAME);
     ADD_SIZE(st, "sv", free_heads * sizeof(SV));
     ADD_ATTR(st, NPattr_NOTE, "n", free_heads);
@@ -2255,7 +2260,44 @@ perl_size(pTHX_ struct state *const st, pPATH)
     NPathPopNode;
   }
 
-  /* XXX iterate over bodies_by_type and crawl the free chains for each */
+  if (1) {
+    int sv_type;
+    for (sv_type = SVt_LAST-1; sv_type >= 0; --sv_type) {
+        void **next;
+        UV free_bodies = 0;
+        UV body_size = body_sizes[sv_type];
+        char nodename[40];
+        const char *typename = svtypenames[sv_type];
+
+        for (next = &PL_body_roots[sv_type]; *next; next = *next) {
+            ++free_bodies;
+        }
+        if (!free_bodies)
+            continue;
+
+        switch (sv_type) { /* see struct body_details comments in sv.c */
+        case SVt_NULL:
+            typename = "HE";
+            body_size = sizeof(HE);
+            break;
+        case SVt_IV:
+            typename = "ptr_tbl_ent";
+            body_size = sizeof(struct ptr_tbl_ent);
+            break;
+        }
+        sprintf(nodename, "free_sv_bodies.%s", typename);
+
+        NPathPushLink("free_sv_bodies");
+        NPathPushNode("free_sv_bodies", NPtype_NAME);
+
+        ADD_SIZE(st, "sv_bodies", free_bodies * body_size);
+        ADD_ATTR(st, NPattr_NOTE, "n", free_bodies);
+        ADD_ATTR(st, NPattr_LABEL, nodename, 0);
+
+        NPathPopNode;
+        NPathPopNode;
+    }
+  }
 
 }
 
@@ -2286,7 +2328,7 @@ malloc_free_size(pTHX_ struct state *const st, pPATH)
     NPathPopNode;
 
     /* TODO get heap size from OS and add a node: unknown = heapsize - perl - ms.bytes_free */
-    /* for now we use bytes_total as an approximation */
+    /* for now we use malloc bytes_total as a good approximation */
     NPathPushLink("unknown");
     NPathPushNode("unknown", NPtype_NAME);
     ADD_SIZE(st, "unknown", ms.bytes_total - st->total_size);
@@ -2294,7 +2336,7 @@ malloc_free_size(pTHX_ struct state *const st, pPATH)
     NPathPopNode;
 
 # else
-    ADD_LINK_ATTR_TO_PREV(st, NPattr_NOTE, "no_malloc_info", 0);
+    ADD_ATTR(st, NPattr_NOTE, "no_malloc_info", 0);
     /* XXX ? */
 # endif
 }
@@ -2356,7 +2398,8 @@ CODE:
 
   st->recurse = RECURSE_INTO_OWNED;
   perl_size(aTHX_ st, NPathLink("perl_interp"));
-  malloc_free_size(aTHX_ st, NPathLink("malloc"));
+  /* TODO size memory used by Devel::SizeMe here (so it's subtracted from malloc.unknown) */
+  malloc_free_size(aTHX_ st, NPathLink("malloc")); /* call last */
 
   RETVAL = st->total_size;
   free_state(aTHX_ st);

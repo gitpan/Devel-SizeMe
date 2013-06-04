@@ -292,6 +292,7 @@ while (<>) {
     elsif ($type eq "L") {
         my $node = $seqn2node{$id} or die "panic: Leaf refers to unknown node $id: $_";
         $node->{leaves}{$name} += $val;
+        $node->{attr}{n}{$name}++;
         $run_size += $val;
         printf "%s+%d=%d %s\n", $indent x ($node->{depth}+1), $val, $run_size, $name
             if $opt_text;
@@ -449,7 +450,7 @@ package Devel::SizeMe::Output;
 use Moo;
 use autodie;
 use Carp qw(croak);
-use HTML::Entities qw(encode_entities);;
+use HTML::Entities qw(encode_entities);
 
 my @attr_names = qw(label_attr size_attr kids_size_attr total_size_attr weight_attr);
 has \@attr_names => (is => 'rw');
@@ -982,7 +983,7 @@ sub emit_addr_node {
 sub emit_item_node {
     my ($self, $item_node, $attr) = @_;
     my $fh = $self->fh or return;
-    my $name = $attr->{label};
+    my $name = $self->fmt_item_label($item_node); # $attr->{label};
     my @node_attr = ( "id=$item_node->{id}" );
     push @node_attr, sprintf("label=%s", _dotlabel($name, $item_node))
         if $name;
