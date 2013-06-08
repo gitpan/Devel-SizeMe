@@ -26,7 +26,8 @@ requires:
   Moo: 1.000007
   Test::More: 0.98
   XSLoader: 0
+  autodie: 2.12
   perl: 5.008
 resources:
   homepage: https://github.com/timbunce/devel-sizeme
-version: 0.15
+version: 0.16

@@ -110,9 +110,11 @@
 #define FOLLOW_MULTI_DONE   22 /* refcnt>1, already followed */
 
 /* detail types to control simplification of node tree */
-#define NPf_DETAIL_COPFILE      0x01
-#define NPf_DETAIL_HEK          0x02
-#define NPf_DETAIL_REFCNT1      0x04
+#define NPf_DETAIL_REFCNT1      0x01
+#define NPf_DETAIL_COPFILE      0x02
+#define NPf_DETAIL_HEK          0x04
+
+#define SMopt_IS_TEST           0x01
 
 
 /*
@@ -149,6 +151,7 @@ struct state {
     bool go_yell;
     int trace_level;
     UV hide_detail;
+    UV opts;
     SV *tmp_sv;
     /* My hunch (not measured) is that for most architectures pointers will
        start with 0 bits, hence the start of this array will be hot, and the
@@ -1399,7 +1402,8 @@ padlist_size(pTHX_ struct state *const st, pPATH, PADLIST *padl)
     ADD_SIZE(st, "PADs", sizeof(PAD*) * ix);
 
     for (ix = 1; ix <= PadlistMAX(padl); ix++) {
-	if (sv_size(aTHX_ st, NPathLink("elem"), (SV*)PadlistARRAY(padl)[ix]))
+	sv_size(aTHX_ st, NPathLink("elem"), (SV*)PadlistARRAY(padl)[ix]);
+        if (NP->seqn) /* link was emitted, so we can add attr XXX encapsulate */
             ADD_LINK_ATTR_TO_TOP(st, NPattr_NOTE, "i", ix);
     }
 
@@ -1460,7 +1464,8 @@ sv_size(pTHX_ struct state *const st, pPATH, const SV * const orig_thing)
         break;
   case FOLLOW_SINGLE_DONE:
         /* we don't output addr note for refcnt=1 (FOLLOW_SINGLE_NOW)
-         * so there's no point in outputting one here
+         * so there's no point in outputting one here.
+         * The SvIMMORTAL's also pass through here.
          */
         if (!(st->hide_detail & NPf_DETAIL_REFCNT1))
             ADD_LINK_ATTR_TO_PREV(st, NPattr_ADDR, "", PTR2UV(thing));
@@ -1468,6 +1473,7 @@ sv_size(pTHX_ struct state *const st, pPATH, const SV * const orig_thing)
   case FOLLOW_MULTI_DEFER:
         ADD_LINK_ATTR_TO_PREV(st, NPattr_ADDR, "", PTR2UV(thing));
         if (get_sv_follow_seencnt(aTHX_ st, thing) == 1) {
+            /* XXX use name of link here ? */
             ADD_LINK_ATTR_TO_PREV(st, NPattr_LABEL, svtypename(thing), 0);
             ADD_LINK_ATTR_TO_PREV(st, NPattr_REFCNT, "", SvREFCNT(thing));
         }
@@ -1522,7 +1528,8 @@ sv_size(pTHX_ struct state *const st, pPATH, const SV * const orig_thing)
         dbg_printf(("total_size: %li AvMAX: %li av_len: $i\n", st->total_size, AvMAX(thing), av_len((AV*)thing)));
 
         for (i=0; i <= AvFILLp(thing); ++i) { /* in natural order */
-            if (sv_size(aTHX_ st, NPathLink("elem"), AvARRAY(thing)[i]))
+            sv_size(aTHX_ st, NPathLink("elem"), AvARRAY(thing)[i]);
+            if (NP->seqn) /* link was emitted, so we can add attr XXX encapsulate */
                 ADD_LINK_ATTR_TO_TOP(st, NPattr_NOTE, "i", i);
         }
     }
@@ -1777,8 +1784,13 @@ static void
 free_memnode_state(pTHX_ struct state *st)
 {
     if (st->node_stream_fh && st->node_stream_name && *st->node_stream_name) {
-        fprintf(st->node_stream_fh, "E %d %f %s\n",
-            getpid(), gettimeofday_nv(aTHX)-st->start_time_nv, "unnamed");
+        Pid_t pid = getpid();
+        NV dur = gettimeofday_nv(aTHX)-st->start_time_nv;
+        if (st->opts & SMopt_IS_TEST) {
+            pid = 0; dur = 0;
+        }
+        fprintf(st->node_stream_fh, "E %lu %d %g %s\n",
+            st->total_size, pid, dur, "unnamed");
         if (*st->node_stream_name == '|') {
             if (pclose(st->node_stream_fh)) /* XXX PerlIO! */
                 warn("%s exited with an error status\n", st->node_stream_name);
@@ -1791,7 +1803,7 @@ free_memnode_state(pTHX_ struct state *st)
 }
 
 static struct state *
-new_state(pTHX_ SV *root_sv)
+new_state(pTHX_ SV *root_sv, UV bool_opts)
 {
     SV *sv;
     struct state *st;
@@ -1799,10 +1811,11 @@ new_state(pTHX_ SV *root_sv)
 
     Newxz(st, 1, struct state);
     st->start_time_nv = gettimeofday_nv(aTHX);
+    st->opts = bool_opts;
     st->recurse = RECURSE_INTO_OWNED;
     st->go_yell = TRUE;
-    if (sizeme_hide && *sizeme_hide) {
-        st->hide_detail = atoi(sizeme_hide);
+    if (sizeme_hide) {
+        st->hide_detail = (*sizeme_hide) ? atoi(sizeme_hide) : NPf_DETAIL_REFCNT1;
     }
     if (NULL != (sv = get_sv("Devel::Size::warn", FALSE))) {
 	st->dangle_whine = st->go_yell = SvIV(sv) ? TRUE : FALSE;
@@ -1831,8 +1844,10 @@ new_state(pTHX_ SV *root_sv)
     /* XXX quick hack */
     st->node_stream_name = PerlEnv_getenv("SIZEME");
     if (st->node_stream_name) {
+        Pid_t pid = getpid();
+        NV start_time = st->start_time_nv;
         if (*st->node_stream_name) {
-            if (*st->node_stream_name == '|')
+            if (*st->node_stream_name == '|') /* XXX PerlIO! */
                 st->node_stream_fh = popen(st->node_stream_name+1, "w");
             else
                 st->node_stream_fh = fopen(st->node_stream_name, "wb");
@@ -1840,8 +1855,12 @@ new_state(pTHX_ SV *root_sv)
                 croak("Can't open '%s' for writing: %s", st->node_stream_name, strerror(errno));
             if(0)setlinebuf(st->node_stream_fh); /* XXX temporary for debugging */
             st->add_attr_cb = np_stream_node_path_info;
-            fprintf(st->node_stream_fh, "S %d %f %s\n",
-                getpid(), st->start_time_nv, "unnamed");
+            if (st->opts & SMopt_IS_TEST) {
+                pid = 0;
+                start_time = 0;
+            }
+            fprintf(st->node_stream_fh, "S %d %d %g %s\n",
+                1, pid, start_time, "unnamed");
         }
         else 
             st->add_attr_cb = np_dump_node_path_info;
@@ -1893,8 +1912,7 @@ unseen_sv_size(pTHX_ struct state *st, pPATH)
             for (sv = sva + 1; sv < svend; ++sv) {
                 if (SvTYPE(sv) != (svtype)SVTYPEMASK && SvREFCNT(sv)) {
                     /* is a live SV */
-                    if (SvTYPE(sv) == want_type) {
-                        /* TODO optimize by checking not_yet_sized first */
+                    if (SvTYPE(sv) == want_type && not_yet_sized(st, sv)) {
                         NPathPushLink(path_link_group);
                         NPathPushNode(path_link_group, NPtype_NAME);
                         if (sv_size(aTHX_ st, NPathLink("arena"), sv)) {
@@ -2342,9 +2360,111 @@ malloc_free_size(pTHX_ struct state *const st, pPATH)
 }
 
 
-MODULE = Devel::SizeMe        PACKAGE = Devel::SizeMe       
+static UV
+perform(SV *actions_sv, SV *options_sv)
+{
+    dTHX;
+    UV total_size;
+#define MaxPathNodeCount 100
+    /* XXX this has some leaks if it croaks */
+    struct state *st = new_state(aTHX_ (SV*)NULL, SMopt_IS_TEST);
+    dNPathNodes(MaxPathNodeCount, NULL);
+    SSize_t i;
+    HV *options_hv;
+
+    if (!SvROK(actions_sv) || SvTYPE(SvRV(actions_sv)) != SVt_PVAV)
+        croak("perform needs an array reference");
+
+    if (options_sv && (!SvROK(options_sv) || SvTYPE(SvRV(options_sv)) != SVt_PVAV))
+        croak("perform options must be a hash reference");
+    options_hv = (options_sv) ? (HV*)SvRV(options_sv) : (HV*)sv_2mortal((SV*)newHV());
+
+    /* [ [ "action", ...args... ], [ ... ], ... ] */
+    for (i=0; i <= AvFILLp((AV*)SvRV(actions_sv)); ++i) {
+        SV *act_spec_sv = AvARRAY((AV*)SvRV(actions_sv))[i];
+        AV *act_spec_av;
+        int action_argcount;
+        char *action_name;
+
+        if (!act_spec_sv || !SvROK(act_spec_sv) || SvTYPE(SvRV(act_spec_sv)) != SVt_PVAV)
+            croak("perform: action[%d] isn't an array ref", i);
+        act_spec_av = (AV*)SvRV(act_spec_sv);
+        action_argcount = av_len(act_spec_av);
+        action_name = SvPV_nolen(AvARRAY(act_spec_av)[0]);
+
+#define IS_ACTION(wanted_name, wanted_argcount) \
+    (strEQ(action_name, wanted_name) \
+        && ((action_argcount != wanted_argcount) \
+            ? (croak("action[%d] %s needs %d args but has %d", i, action_name, wanted_argcount, action_argcount),1) \
+            : 1) )
+#define ACTION_ARG_PV(argnum) (SvPV_nolen(AvARRAY(act_spec_av)[argnum]))
+#define ACTION_ARG_UV(argnum) (SvUV(      AvARRAY(act_spec_av)[argnum]))
+
+        warn("perform %s\n", action_name);
+        if (IS_ACTION("pushnode", 2)) {
+            NPathPushNode(ACTION_ARG_PV(1), ACTION_ARG_UV(2));
+        }
+        else if (IS_ACTION("popnode", 0)) {
+            NPathPopNode;
+        }
+        else if (IS_ACTION("addsize", 2)) {
+            ADD_SIZE(st, ACTION_ARG_PV(1), ACTION_ARG_UV(2));
+        }
+        else if (IS_ACTION("addattr", 3)) {
+            ADD_ATTR(st, ACTION_ARG_UV(1), ACTION_ARG_PV(2), ACTION_ARG_UV(3));
+        }
+        else {
+            croak("perform: Unknown action '%p' at index %d", action_name, i);
+        }
+    }
+
+    total_size = st->total_size;
+    warn("perform complete - total_size %lu\n", total_size);
+    free_state(aTHX_ st);
+    return total_size;
+}
+
+
+MODULE = Devel::SizeMe        PACKAGE = Devel::SizeMe::TestWrite
 
 PROTOTYPES: DISABLE
+
+UV
+perform(SV *actions_sv, SV *options_sv=NULL)
+OUTPUT:
+    RETVAL
+
+
+MODULE = Devel::SizeMe        PACKAGE = Devel::SizeMe::Core
+
+PROTOTYPES: DISABLE
+
+
+UV
+constant()
+    PROTOTYPE:
+    ALIAS:
+        NPtype_NAME	    = NPtype_NAME
+        NPtype_LINK	    = NPtype_LINK
+        NPtype_SV	    = NPtype_SV
+        NPtype_MAGIC	    = NPtype_MAGIC
+        NPtype_OP	    = NPtype_OP
+        NPtype_PLACEHOLDER  = NPtype_PLACEHOLDER
+        NPattr_LEAFSIZE	    = NPattr_LEAFSIZE
+        NPattr_LABEL	    = NPattr_LABEL
+        NPattr_PADFAKE	    = NPattr_PADFAKE
+        NPattr_PADNAME	    = NPattr_PADNAME
+        NPattr_PADTMP	    = NPattr_PADTMP
+        NPattr_NOTE	    = NPattr_NOTE
+        NPattr_ADDR	    = NPattr_ADDR
+        NPattr_REFCNT	    = NPattr_REFCNT
+    CODE:
+        RETVAL = ix;
+    OUTPUT:
+        RETVAL
+
+
+MODULE = Devel::SizeMe        PACKAGE = Devel::SizeMe
 
 UV
 size(orig_thing)
@@ -2362,7 +2482,7 @@ CODE:
     thing = SvRV(thing);
   }
 
-  st = new_state(aTHX_ thing);
+  st = new_state(aTHX_ thing, 0);
   st->recurse = ix;
   sv_size(aTHX_ st, NULL, thing);
   RETVAL = st->total_size;
@@ -2371,13 +2491,14 @@ CODE:
 OUTPUT:
   RETVAL
 
+
 UV
 perl_size()
 CODE:
 {
   /* just the current perl interpreter */
   /* PL_defstash works around the main:: => :: ref loop */
-  struct state *st = new_state(aTHX_ (SV*)PL_defstash);
+  struct state *st = new_state(aTHX_ (SV*)PL_defstash, 0);
   st->recurse = RECURSE_INTO_OWNED;
   perl_size(aTHX_ st, NULL);
   RETVAL = st->total_size;
@@ -2392,7 +2513,7 @@ CODE:
 {
   /* the current perl interpreter plus malloc, in the context of total heap size */
 
-  struct state *st = new_state(aTHX_ (SV*)PL_defstash);
+  struct state *st = new_state(aTHX_ (SV*)PL_defstash, 0);
   dNPathNodes(1, NULL);
   NPathPushNode("heap", NPtype_NAME);
 
@@ -2406,3 +2527,4 @@ CODE:
 }
 OUTPUT:
   RETVAL
+
