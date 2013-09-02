@@ -103,6 +103,10 @@
 
 
 /* the values are arbitrary but chosen to be mnemonic */
+/* XXX we don't yet account for pointers that might be chased from
+ * structures that don't "own" a ref count, we just treat all pointers
+ * to SVs as owning a ref - this may need refining
+ */
 #define FOLLOW_SINGLE_NOW   11 /* refcnt=1, follow now */
 #define FOLLOW_SINGLE_DONE  12 /* refcnt=1, already followed */
 #define FOLLOW_MULTI_DEFER  20 /* refcnt>1, follow later */
@@ -209,7 +213,7 @@ struct state {
             NP->id = nodeid; \
             NP->type = nodetype; \
             NP->seqn = 0; \
-            if(st->trace_level>=9)fprintf(stderr,"NPathPushNode (%p <-) %p <- [%d %p]\n", NP->prev, NP, nodetype,nodeid);\
+            if(st->trace_level>=9)fprintf(stderr,"NPathPushNode (%p <-) %p <- [%ld %p]\n", NP->prev, NP, (long)nodetype,nodeid);\
             NP++; \
             NP->id = Nullch; /* safety/debug */ \
             NP->seqn = 0; \
@@ -262,8 +266,9 @@ struct state {
 #define NPtype_MAGIC    0x04
 #define NPtype_OP       0x05
 #define NPtype_PLACEHOLDER  0x06
+#define NPtype_max          0x06
 
-/* XXX these should probably be generalized into flag bits */
+/* XXX these should possibly be generalized into flag bits */
 #define NPattr_LEAFSIZE 0x00
 #define NPattr_LABEL    0x01
 #define NPattr_PADFAKE  0x02
@@ -272,6 +277,7 @@ struct state {
 #define NPattr_NOTE     0x05
 #define NPattr_ADDR     0x06
 #define NPattr_REFCNT   0x07
+#define NPattr_max      0x07
 
 #define _ADD_ATTR_NP(st, attr_type, attr_name, attr_value, np) \
   STMT_START { \
@@ -2245,7 +2251,7 @@ perl_size(pTHX_ struct state *const st, pPATH)
      * more SVs that haven't been visited yet
      */
     while (deferred_by_refcnt_size(aTHX_ st, NPathLink("ref_loops"), ++cycle))
-        1;
+        (void)1;
     NPathPopNode;
     NPathPopNode;
   }
@@ -2387,7 +2393,7 @@ perform(SV *actions_sv, SV *options_sv)
         char *action_name;
 
         if (!act_spec_sv || !SvROK(act_spec_sv) || SvTYPE(SvRV(act_spec_sv)) != SVt_PVAV)
-            croak("perform: action[%d] isn't an array ref", i);
+            croak("perform: action[%lu] isn't an array ref", i);
         act_spec_av = (AV*)SvRV(act_spec_sv);
         action_argcount = av_len(act_spec_av);
         action_name = SvPV_nolen(AvARRAY(act_spec_av)[0]);
@@ -2395,14 +2401,18 @@ perform(SV *actions_sv, SV *options_sv)
 #define IS_ACTION(wanted_name, wanted_argcount) \
     (strEQ(action_name, wanted_name) \
         && ((action_argcount != wanted_argcount) \
-            ? (croak("action[%d] %s needs %d args but has %d", i, action_name, wanted_argcount, action_argcount),1) \
+            ? (croak("action[%lu] %s needs %d args but has %d", i, action_name, wanted_argcount, action_argcount),1) \
             : 1) )
 #define ACTION_ARG_PV(argnum) (SvPV_nolen(AvARRAY(act_spec_av)[argnum]))
 #define ACTION_ARG_UV(argnum) (SvUV(      AvARRAY(act_spec_av)[argnum]))
 
-        warn("perform %s\n", action_name);
+        if (st->trace_level)
+            warn("perform %s\n", action_name);
         if (IS_ACTION("pushnode", 2)) {
             NPathPushNode(ACTION_ARG_PV(1), ACTION_ARG_UV(2));
+        }
+        else if (IS_ACTION("pushlink", 1)) {
+            NPathPushLink(ACTION_ARG_PV(1));
         }
         else if (IS_ACTION("popnode", 0)) {
             NPathPopNode;
@@ -2411,15 +2421,19 @@ perform(SV *actions_sv, SV *options_sv)
             ADD_SIZE(st, ACTION_ARG_PV(1), ACTION_ARG_UV(2));
         }
         else if (IS_ACTION("addattr", 3)) {
-            ADD_ATTR(st, ACTION_ARG_UV(1), ACTION_ARG_PV(2), ACTION_ARG_UV(3));
+            UV attr_type = ACTION_ARG_UV(1);
+            char *attr_name = ACTION_ARG_PV(2);
+            UV attr_value = ACTION_ARG_UV(3);
+            ADD_ATTR(st, attr_type, attr_name, attr_value);
         }
         else {
-            croak("perform: Unknown action '%p' at index %d", action_name, i);
+            croak("perform: Unknown action '%s' at index %lu", action_name, i);
         }
     }
 
     total_size = st->total_size;
-    warn("perform complete - total_size %lu\n", total_size);
+    if (st->trace_level)
+        warn("perform complete - total_size %lu\n", total_size);
     free_state(aTHX_ st);
     return total_size;
 }
@@ -2450,6 +2464,7 @@ constant()
         NPtype_MAGIC	    = NPtype_MAGIC
         NPtype_OP	    = NPtype_OP
         NPtype_PLACEHOLDER  = NPtype_PLACEHOLDER
+        NPtype_max          = NPtype_max
         NPattr_LEAFSIZE	    = NPattr_LEAFSIZE
         NPattr_LABEL	    = NPattr_LABEL
         NPattr_PADFAKE	    = NPattr_PADFAKE
@@ -2458,6 +2473,7 @@ constant()
         NPattr_NOTE	    = NPattr_NOTE
         NPattr_ADDR	    = NPattr_ADDR
         NPattr_REFCNT	    = NPattr_REFCNT
+        NPattr_max	    = NPattr_max
     CODE:
         RETVAL = ix;
     OUTPUT:

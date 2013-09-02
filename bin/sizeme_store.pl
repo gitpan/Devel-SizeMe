@@ -183,7 +183,7 @@ sub leave_node {
         }
         else {
             if ( keys %{$links_to_addr{$addr}||{}} > 1) {
-                my @candidates = keys %{$links_to_addr{$addr}};
+                my @candidates = sort { $a <=> $b } keys %{$links_to_addr{$addr}};
                 # XXX for now we simply pick one that isn't our current parent
                 # because our current parent will be the arena for SVs where
                 # we've not been able to find all the refs
@@ -507,7 +507,7 @@ sub resolve_addr_to_item {
     my $links_hashref = $links_to_addr{$addr}
         or return; # we've no links waiting for this addr
 
-    my @links = map { $seqn2node{$_} } keys %$links_hashref;
+    my @links = map { $seqn2node{$_} } sort { $a <=> $b } keys %$links_hashref;
     for my $link_node (@links) {
         # skip link if it's the one that's the actual parent
         # (because that'll get its own link drawn later)
@@ -524,9 +524,11 @@ sub write_pending_links {
     my $self = shift;
     warn "write_pending_links\n"
         if $opt_debug;
-    while ( my ($link_id, $dests) = each %pending_links) {
+    for my $link_id (sort { $a <=> $b } keys %pending_links) {
+        my $dests = $pending_links{$link_id};
         my $link_node = $seqn2node{$link_id} or die "No node for id $link_id";
-        while ( my ($dest_id, $attr) = each %$dests) {
+        for my $dest_id (sort { $a <=> $b } keys %$dests) {
+            my $attr = $dests->{$dest_id};
             $self->emit_link($link_id, $dest_id, $attr);
         }
     }
@@ -537,9 +539,10 @@ sub write_dangling_links {
 
     warn "write_dangling_links\n"
         if $opt_debug;
-    while ( my ($addr, $link_ids) = each %links_to_addr ) {
+    for my $addr (sort { $a <=> $b } keys %links_to_addr) {
+        my $link_ids = $links_to_addr{$addr};
         next if $node_id_of_addr{$addr}; # not dangling
-        my @link_ids = keys %$link_ids;
+        my @link_ids = sort { $a <=> $b } keys %$link_ids;
 
         # one of the links that points to this addr has
         # attributes that describe the addr being pointed to
@@ -769,7 +772,8 @@ sub write_epilogue {
     my $fh = $self->fh or return;
 
     print $fh qq{<edges>\n};
-    while ( my ($id, $edge) = each %buffered_edges ) {
+    for my $id (sort { $a <=> $b } %buffered_edges) {
+        my $edge = $buffered_edges{$id};
         my ($src, $dest, $label, $weight, $viz) = @$edge;
         my $viz_str = _fmt_viz($viz);
         my $suffix = ($viz_str) ? ">$viz_str</edge>" : " />";
@@ -824,7 +828,8 @@ sub _emit_node {
     printf $fh qq{\t<node id="%s" label="%s">\n}, $id, ::xml_escape($label||'');
     if (keys %$attr) {
         print $fh qq{\t<attvalues>\n};
-        while ( my ($k, $v) = each %$attr ) {
+        for my $k (sort keys %$attr) {
+            my $v = $attr->{$k};
             next if not defined $v;
             printf $fh qq{\t\t<attvalue for="%s" value="%s"/>\n},
                 $k, ::xml_escape($v);

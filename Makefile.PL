@@ -17,7 +17,7 @@ write_header(
 
 my %MakefileOpts = (
     NAME => 'Devel::SizeMe',
-    VERSION_FROM => 'lib/Devel/SizeMe.pm',
+    VERSION_FROM => 'lib/Devel/SizeMe/Core.pm',
     DEFINE => "-DALIGN_BITS=$ptr_bits",
     PREREQ_PM => {
         'autodie' => '2.12',
@@ -39,6 +39,7 @@ my %MakefileOpts = (
     },
     META_MERGE => {
         resources => {
+            'meta-spec' => { version => 2 },
             repository  => {
                 type => 'git',
                 url => 'git://github.com/timbunce/devel-sizeme.git',
@@ -137,6 +138,7 @@ sub CheckConflicts {
 
 sub extract_chunk_from_file {
     my ($file, $start_regex, $end_regex) = @_;
+    $file =~ s/^~/$ENV{HOME}/ if $ENV{HOME};
     open my $fh, '<', $file or die $!;
 
     my $def;
