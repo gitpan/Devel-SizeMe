@@ -1495,7 +1495,8 @@ sv_size(pTHX_ struct state *const st, pPATH, const SV * const orig_thing)
 
   type = SvTYPE(thing);
   if (type > SVt_LAST) {
-      fprintf(stderr, "Unknown SV type: %u encountered at ", type);
+      fprintf(stderr, "%s SV type: %u encountered at ",
+        (SvTYPE(thing) == (svtype)SVTYPEMASK) ? "Freed" : "Unknown", type);
       np_dump_node_path(aTHX_ st, NP);
       fprintf(stderr, ":\n");
       sv_dump((SV*)thing);
@@ -1795,7 +1796,7 @@ free_memnode_state(pTHX_ struct state *st)
         if (st->opts & SMopt_IS_TEST) {
             pid = 0; dur = 0;
         }
-        fprintf(st->node_stream_fh, "E %lu %d %g %s\n",
+        fprintf(st->node_stream_fh, "E %lu %d %" NVgf " %s\n",
             st->total_size, pid, dur, "unnamed");
         if (*st->node_stream_name == '|') {
             if (pclose(st->node_stream_fh)) /* XXX PerlIO! */
@@ -1865,7 +1866,7 @@ new_state(pTHX_ SV *root_sv, UV bool_opts)
                 pid = 0;
                 start_time = 0;
             }
-            fprintf(st->node_stream_fh, "S %d %d %g %s\n",
+            fprintf(st->node_stream_fh, "S %d %d %" NVgf " %s\n",
                 1, pid, start_time, "unnamed");
         }
         else 
